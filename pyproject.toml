@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sixfonia-analytics"
+version = "0.1.0"
+description = "Unofficial SIXFONIA YouTube analytics: collection, analysis and X-post image generation"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "japanize-matplotlib",
+    "google-api-python-client",
+    "requests",
+    "Pillow",
+    "pytz",
+]
+
+[project.optional-dependencies]
+comment = ["nagisa", "wordcloud", "cloudia"]
+gcs = ["google-cloud-storage"]
+
+[tool.setuptools]
+packages = ["sixfonia_analytics"]
