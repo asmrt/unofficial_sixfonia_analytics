@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit のレビューを日本語で行う設定。
+# 詳細スキーマ: https://docs.coderabbit.ai/reference/configuration
+language: ja-JP
