@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 comment = ["nagisa", "wordcloud", "cloudia"]
 gcs = ["google-cloud-storage"]
+dev = ["pytest"]
 
 [tool.setuptools]
 packages = ["sixfonia_analytics"]

@@ -59,9 +59,21 @@ token = userdata.get("GITHUB_TOKEN")
 - 移行期のみ: `MyDrive/YouTube_Data/`（旧フラット構成）にもデュアルライト
 - スキーマ: `videoId, viewCount, likeCount, commentCount, videoURL, view_date`
 
+## 日次収集の自動化（GCP）
+
+Colab で手動実行している日次収集を GCP で自動化するパイプラインを [`pipeline/`](pipeline/README.md) に置いている
+（Cloud Scheduler → Cloud Function → GCS・BigQuery）。構築手順は [pipeline/docs/SETUP.md](pipeline/docs/SETUP.md)。
+当面は Colab 運用と並行する。未決事項は [pipeline/docs/IMPROVEMENTS.md](pipeline/docs/IMPROVEMENTS.md) を参照。
+
+## テスト
+
+```bash
+pip install -e ".[dev]" && pytest tests -q
+```
+
 ## 関連
 
-推し活ツール（新着一覧・未視聴チェック・画像生成）と日次収集の自動化（GCP）は別リポジトリに移行済み。
+推し活ツール（新着一覧・未視聴チェック・画像生成）は別リポジトリに移行済み。
 全体の概要は [docs/oshikatsu_apps_overview.md](docs/oshikatsu_apps_overview.md) を参照。
 
 ## 開発メモ
