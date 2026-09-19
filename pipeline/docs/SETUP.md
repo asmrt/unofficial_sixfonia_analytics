@@ -11,17 +11,17 @@
 Cloud Scheduler（01:00 JST）
   └→ Cloud Function youtube-data-fetch
         1. YouTube API から全動画の再生数などを取得
-        2. GCS にチャンネル別 CSV を保存（生データの保管用）
-        3. BigQuery テーブルに前日分を読み込み（取得できたチャンネルの前日分を消してから追加）
-        4. 動画マスタ（videos.json）を公開URLから GCS にコピー
-BigQuery
-  ├ video_statistics            … 日次スナップショット（view_date で日付パーティション）
-  └ video_statistics_with_diff  … 前日比（view_diff）をその場で計算するビュー
+        2. GCS にチャンネル別 CSV を保存（channel 列つき。ここが唯一のデータ保管場所）
+        3. 動画マスタ（videos.json）を公開URLから GCS にコピー。あわせて videos.ndjson も書く
+BigQuery（外部テーブル・ビューのみ。データは持たない）
+  ├ ext_video_statistics / ext_videos      … GCS の CSV・NDJSON を直接読む外部テーブル
+  └ video_statistics / video_statistics_with_diff / videos … スネークケースに変換したビュー
 ```
 
-- 取得から BigQuery への読み込みまで 1 つの関数で完結します。スケジュールクエリや外部テーブルは使いません。
-- 読み込みは「その日・そのチャンネルの行を消してから追加する」方式なので、何度リトライしても重複しません。取得に失敗したチャンネルの行は触らないので、前の試行で入った分も消えません。
-- 前日比はテーブルに保存せず、ビューで直前の日との差を計算します（欠けた日があっても次の日の値が出ます）。
+- BigQuery はデータを持たず、クエリのたびに GCS を直接読みます。関数は BigQuery に一切触りません。
+- CSV を差し替えれば、次のクエリから内容が反映されます。
+- 移し替え処理（スケジュールクエリ・読み込みジョブ）が無いので、関数の実行やリトライが何時に終わっても取りこぼしません。
+- 列名は BigQuery 側（外部テーブル・ビュー）はスネークケース、GCS 上の CSV の列名は既存のまま（camelCase）です。
 
 ## 全体の流れ
 
@@ -30,7 +30,7 @@ BigQuery
 | 1 | 変数設定・API 有効化 | 5分 |
 | 2 | YouTube API キー作成 | 5分 |
 | 3 | GCS バケット作成 | 2分 |
-| 4 | BigQuery テーブル・ビュー作成 | 5分 |
+| 4 | BigQuery 外部テーブル・ビュー作成 | 5分 |
 | 5 | サービスアカウント作成 | 3分 |
 | 6 | Cloud Functions デプロイ | 5分 |
 | 7 | 動作確認（手動実行） | 5分 |
@@ -114,7 +114,7 @@ gcloud storage buckets create gs://$BUCKET \
 > 保存期間を区切る必要が出た場合は、ライフサイクルルールで古い CSV を自動削除できます
 > （例: 30日で削除 → `gcloud storage buckets update gs://$BUCKET --lifecycle-file=lifecycle.json`）。
 
-## 4. BigQuery テーブル・ビュー作成
+## 4. BigQuery 外部テーブル・ビュー作成
 
 このリポジトリ（`unofficial_sixfonia_analytics`）を Cloud Shell に `git clone` するかアップロードし、**`pipeline/` ディレクトリから**実行します（手順6のデプロイも同じ場所基準）。
 
@@ -131,30 +131,34 @@ cd ~/unofficial_sixfonia_analytics/pipeline
 bq mk --location=$REGION --dataset $DATASET
 ```
 
-リポジトリの SQL は、プロジェクトIDとデータセット名を `YOUR_PROJECT_ID` / `YOUR_DATASET` という
+リポジトリの SQL は、プロジェクトID・データセット名・バケット名を `YOUR_PROJECT_ID` / `YOUR_DATASET` / `YOUR_BUCKET` という
 プレースホルダで書いています。実行時に置換して `bq` に流す関数を定義してから実行します
 （ファイル自体は書き換えないので、置換後の内容がコミットされることはありません）。
 
 ```bash
-run_sql() { sed -e "s/YOUR_PROJECT_ID/$PROJECT_ID/g" -e "s/YOUR_DATASET/$DATASET/g" "$1" | bq query --use_legacy_sql=false; }
+run_sql() { sed -e "s/YOUR_PROJECT_ID/$PROJECT_ID/g" -e "s/YOUR_DATASET/$DATASET/g" -e "s/YOUR_BUCKET/$BUCKET/g" "$1" | bq query --use_legacy_sql=false; }
 
-run_sql sql/01_create_table.sql
-run_sql sql/02_create_view.sql
+run_sql sql/01_create_external_tables.sql
+run_sql sql/02_create_views.sql
 ```
 
-- `video_statistics`: 日次スナップショット。`view_date` で日付パーティション。
-- `video_statistics_with_diff`: `video_statistics` の全列に `view_diff`（直前の日との再生数差）と
-  `diff_days`（何日前との差か。通常は 1）を足したビュー。分析はこちらを読みます。
+作られるもの:
 
-> **保存期間**: テーブルも当面は期限なしです。規約確認の結果、区切る必要が出た場合は
-> `bq update --time_partitioning_expiration <秒数> $PROJECT_ID:$DATASET.video_statistics`
-> で、期限を過ぎたパーティション（日）が自動で削除されるようにできます。
+- `ext_video_statistics`（外部テーブル）: `gs://$BUCKET/*.csv` を直接読む。列は `videoId, viewCount, likeCount, commentCount, videoURL, thumbnail, view_date, channel`。
+- `ext_videos`（外部テーブル）: `gs://$BUCKET/master/videos.ndjson` を直接読む。列は `videoId, channel, title, publishedAt, durationSec, isShort, thumbnail, tags, available`。
+- `video_statistics`（ビュー）: `ext_video_statistics` をスネークケースの列名にしたもの。
+- `video_statistics_with_diff`（ビュー）: `video_statistics` の全列に `view_diff`（直前の日との再生数差）と
+  `diff_days`（何日前との差か。通常は 1）を足したもの。分析はこちらを読みます。
+- `videos`（ビュー）: `ext_videos` をスネークケースの列名にしたもの。
+
+> この時点ではまだ GCS にファイルが無いので（手順7で初めて書き込まれる）、ここで上記のビューにクエリを投げると
+> 「一致するファイルが無い」エラーになります。想定どおりです。
 
 ## 5. サービスアカウント作成
 
 ### 5-1. Cloud Functions 実行用
 
-関数に必要な権限だけを付けます（GCS への書き込み、API キーの読み取り、BigQuery のテーブル1つへの書き込み）。
+関数に必要な権限だけを付けます（GCS への書き込み、API キーの読み取り）。関数は BigQuery に一切触らないので、BigQuery まわりの権限は不要です。
 
 ```bash
 gcloud iam service-accounts create youtube-fetch-sa \
@@ -171,19 +175,10 @@ gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
 gcloud secrets add-iam-policy-binding youtube-api-key \
   --member="serviceAccount:$SA" \
   --role="roles/secretmanager.secretAccessor"
-
-# BigQuery: このテーブルだけに書き込める（手順4で作成済みのテーブルに付与する）
-bq add-iam-policy-binding \
-  --member="serviceAccount:$SA" \
-  --role="roles/bigquery.dataEditor" \
-  $PROJECT_ID:$DATASET.video_statistics
-
-# BigQuery: 読み込みジョブを実行できる（ジョブの実行権限はプロジェクト単位でしか付けられない）
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:$SA" \
-  --role="roles/bigquery.jobUser" \
-  --condition=None
 ```
+
+> BigQuery を読むのは自分のアカウント（オーナー）なので、追加の権限は不要です。Looker Studio も
+> 作成者の認証情報でデータを読む設定にしていれば、追加設定は不要です。
 
 ### 5-2. Cloud Scheduler 起動用（関数の呼び出し権限のみ）
 
@@ -210,7 +205,7 @@ gcloud functions deploy youtube-data-fetch \
   --trigger-http \
   --no-allow-unauthenticated \
   --service-account="youtube-fetch-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-  --set-env-vars="GCS_BUCKET=$BUCKET,BQ_TABLE=$PROJECT_ID.$DATASET.video_statistics,SNAPSHOT_URL=$SNAPSHOT_URL" \
+  --set-env-vars="GCS_BUCKET=$BUCKET,SNAPSHOT_URL=$SNAPSHOT_URL" \
   --set-secrets="YOUTUBE_API_KEY=youtube-api-key:latest" \
   --memory=512Mi \
   --timeout=540s
@@ -235,7 +230,7 @@ curl -m 600 -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$STA
 期待レスポンス（例）:
 
 ```json
-{"message": "Stats: 7/7 completed", "results": {"hima72": true, ...}, "bq_rows": 3443, "snapshot_updated_at": "2026-09-19T02:21:52+09:00", "duration_seconds": 123.4}
+{"message": "Stats: 7/7 completed", "results": {"hima72": true, ...}, "snapshot_updated_at": "2026-09-19T02:21:52+09:00", "duration_seconds": 123.4}
 ```
 
 GCS にファイルができているか確認します。
@@ -244,16 +239,19 @@ GCS にファイルができているか確認します。
 gcloud storage ls "gs://$BUCKET/**" | head -20
 ```
 
-- `{channel}/{channel}_video_statistics_{YYYYMMDD}.csv` × 7（日付は**実行日の前日**）
+- `{channel}/{channel}_video_statistics_{YYYYMMDD}.csv` × 7（日付は**実行日の前日**。8列で、最後の列が `channel`）
 - `master/videos.json` × 1（動画マスタ。`SNAPSHOT_URL` の `videos.json` のコピー）
+- `master/videos.ndjson` × 1（`videos.json` の `videos` 配列を1行1動画にした NDJSON。BigQuery の外部テーブルが読む）
 
-BigQuery に入っているか確認します。
+BigQuery（外部テーブル経由）で読めるか確認します。
 
 ```bash
 bq query --use_legacy_sql=false "
 SELECT channel, COUNT(*) AS videos, MAX(view_date) AS latest
 FROM \`$PROJECT_ID.$DATASET.video_statistics\`
 GROUP BY channel ORDER BY channel"
+
+bq query --use_legacy_sql=false "SELECT COUNT(*) FROM \`$PROJECT_ID.$DATASET.videos\`"
 ```
 
 7 チャンネル分の行数が出れば成功です（初日は前の日のデータが無いため、ビューの `view_diff` は全行 NULL。2日目から値が入ります）。
@@ -290,9 +288,9 @@ gcloud scheduler jobs create http youtube-daily-stats \
   --min-backoff=5m
 ```
 
-> 関数は一部チャンネルの失敗や BigQuery への読み込み失敗で 500 を返すため、Scheduler が最大3回リトライします。
-> GCS は同名ファイルの上書き、BigQuery は「その日・そのチャンネルの行を消してから追加」なので、リトライしても重複しません。
-> 取り込みも同じ関数の中で行うため、リトライが何時に終わっても取りこぼしは起きません。
+> 関数は一部チャンネルの取得失敗で 500 を返すため、Scheduler が最大3回リトライします。
+> リトライは同じパス・同じファイル名の CSV を上書きするだけなので、重複は発生しません。
+> BigQuery への移し替え処理が無いため、リトライが何時に終わっても取りこぼしは起きません。
 
 スケジュールを待たずに動作確認する場合:
 
@@ -318,7 +316,8 @@ gcloud scheduler jobs run youtube-daily-stats --location=$REGION
    - 通知の頻度: 30分（同一障害での連続通知を抑制）
    - 通知チャネル: 手順1で作成したメール
 
-> これで「一部チャンネルの取得失敗」「BigQuery への読み込み失敗」「動画マスタのコピー失敗」「関数自体のクラッシュ」をすべてこの 1 つのアラートで拾えます。
+> これで「一部チャンネルの取得失敗」「動画マスタのコピー失敗」「関数自体のクラッシュ」をすべてこの 1 つのアラートで拾えます。
+> 失敗はすべて関数のログに出るので、確認先はここだけです。
 > 動画マスタのコピー失敗は統計の取得とは独立なので、関数は 200 を返し、Scheduler のリトライは起きません（翌日の実行で最新版に上書きされます）。
 
 ## 10. 予算アラートの設定
@@ -340,10 +339,12 @@ gcloud scheduler jobs run youtube-daily-stats --location=$REGION
 ### 毎日のフロー（すべて自動）
 
 ```text
-01:00 JST  youtube-data-fetch  → GCS に前日分 CSV、BigQuery に前日分を読み込み、動画マスタ（videos.json）をコピー
+01:00 JST  youtube-data-fetch  → GCS に前日分 CSV（channel列つき）、動画マスタ（videos.json / videos.ndjson）をコピー
 
 （別系統）動画マスタ videos.json は別システムが毎日生成（01:00 の時点で前日版のことがある）
 ```
+
+BigQuery は上記の GCS を外部テーブル経由でそのつど読むだけで、移し替え処理はありません。
 
 ### よく使う確認コマンド
 
@@ -354,14 +355,26 @@ gcloud functions logs read youtube-data-fetch --gen2 --region=$REGION --limit=50
 # スケジューラの実行履歴
 gcloud scheduler jobs list --location=$REGION
 
-# 前日比増分が大きい動画 Top 20
+# 前日比増分が大きい動画 Top 20（タイトルを付ける場合は videos を JOIN）
 bq query --use_legacy_sql=false "
-SELECT channel, videoId, viewCount, view_diff, videoURL
-FROM \`$PROJECT_ID.$DATASET.video_statistics_with_diff\`
-WHERE view_date = DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 DAY)
-ORDER BY view_diff DESC
+SELECT s.channel, s.video_id, v.title, s.view_count, s.view_diff, s.video_url
+FROM \`$PROJECT_ID.$DATASET.video_statistics_with_diff\` AS s
+LEFT JOIN \`$PROJECT_ID.$DATASET.videos\` AS v USING (video_id)
+WHERE s.view_date = DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 DAY)
+ORDER BY s.view_diff DESC
 LIMIT 20"
 ```
+
+### CSV を差し替える
+
+GCS 上の CSV が唯一のデータなので、間違いに気づいたら同じパス・同じファイル名で上書きアップロードすれば、次のクエリから反映されます。
+
+```bash
+gcloud storage cp 修正版.csv "gs://$BUCKET/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv"
+```
+
+- 列の並び（8列: `videoId, viewCount, likeCount, commentCount, videoURL, thumbnail, view_date, channel`）は変えないこと。外部テーブルは位置で列を読みます。
+- 壊れた（列数が合わない・型が合わないなど）CSV が1つでも `gs://$BUCKET/*.csv` に混じると、`video_statistics` へのクエリ全体がエラーになります。差し替え後は一度クエリして確認してください。
 
 ### チャンネルの追加・削除
 
@@ -381,7 +394,7 @@ LIMIT 20"
 |---|---|
 | Cloud Functions | 1日1回・数分程度 → 無料枠内 |
 | Cloud Storage | CSV 約 200KB/日 + JSON → 月数円以下 |
-| BigQuery | ストレージ・クエリとも無料枠内（10GB / 1TB スキャン） |
+| BigQuery | クエリのたびに全 CSV を読む（1年で約120万行・数百MB）。無料枠（1TB/月スキャン）に対して十分小さい |
 | Cloud Scheduler | 3ジョブまで無料 |
 | Secret Manager | 無料枠内 |
 | YouTube Data API | 無料（クォータ内） |

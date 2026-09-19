@@ -1,5 +1,4 @@
 functions-framework==3.10.2
-google-cloud-bigquery==3.45.2
 google-cloud-storage==3.10.1
 google-api-python-client==2.196.0
 protobuf>=6.33.5,<7.0

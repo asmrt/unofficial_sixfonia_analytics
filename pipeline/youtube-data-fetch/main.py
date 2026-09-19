@@ -3,7 +3,7 @@
 
 import functions_framework
 from googleapiclient.discovery import build
-from google.cloud import bigquery, storage
+from google.cloud import storage
 import time
 import csv
 import datetime
@@ -32,17 +32,14 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("YOUTUBE_API_KEY")
 GCS_BUCKET = os.getenv("GCS_BUCKET", "youtube-metrics-bucket")
-# 読み込み先の BigQuery テーブル（project.dataset.table）。プロジェクトIDはリポジトリに書かず、デプロイ時に渡す
-BQ_TABLE = os.getenv("BQ_TABLE")
 # 動画マスタ（タイトル・投稿日・Shorts 判定など）の公開URL。生成は別システムが行い、
 # ここでは取得して GCS にコピーするだけ（YouTube API で二重に取得しない）。URL はデプロイ時に渡す
 SNAPSHOT_URL = os.getenv("SNAPSHOT_URL")
 SNAPSHOT_BLOB = "master/videos.json"
+SNAPSHOT_NDJSON_BLOB = "master/videos.ndjson"
 
 if not API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set")
-if not BQ_TABLE:
-    raise RuntimeError("BQ_TABLE is not set")
 if not SNAPSHOT_URL:
     raise RuntimeError("SNAPSHOT_URL is not set")
 
@@ -124,7 +121,7 @@ def save_to_gcs(channel_name, filename, data):
     bucket = client.bucket(GCS_BUCKET)
 
     buf = StringIO()
-    fields = ["videoId", "viewCount", "likeCount", "commentCount", "videoURL", "thumbnail", "view_date"]
+    fields = ["videoId", "viewCount", "likeCount", "commentCount", "videoURL", "thumbnail", "view_date", "channel"]
     writer = csv.DictWriter(buf, fieldnames=fields)
     writer.writeheader()
     writer.writerows(data)
@@ -137,7 +134,11 @@ def save_to_gcs(channel_name, filename, data):
 def copy_snapshot_to_gcs():
     """動画マスタ（videos.json）を公開URLから取得し、GCS に上書き保存する。
 
-    戻り値は動画マスタの updated_at。中身が動画マスタとして不正なら保存せずに例外を投げる
+    videos.json をそのまま保存するのに加えて、BigQuery の外部テーブル（NEWLINE_DELIMITED_JSON）が
+    直接読めるよう、videos 配列を1行1動画の NDJSON に変換した videos.ndjson も保存する
+    （キーの変換はしない。スネークケースへのリネームは BigQuery 側のビューで行う）。
+
+    戻り値は動画マスタの updated_at。中身が動画マスタとして不正なら何も保存せずに例外を投げる
     （エラーページなどで GCS 上の正しいファイルを上書きしないため）。
     """
     with urllib.request.urlopen(SNAPSHOT_URL, timeout=60) as res:
@@ -146,15 +147,18 @@ def copy_snapshot_to_gcs():
     if not isinstance(data, dict) or not isinstance(data.get("videos"), list) or not data["videos"]:
         raise ValueError("snapshot has no videos")
 
+    ndjson = "\n".join(json.dumps(video, ensure_ascii=False) for video in data["videos"]) + "\n"
+
     client = storage.Client()
-    blob = client.bucket(GCS_BUCKET).blob(SNAPSHOT_BLOB)
-    blob.upload_from_string(body, content_type="application/json")
-    logger.info(f"Saved to GCS: {SNAPSHOT_BLOB} (updated_at={data.get('updated_at')})")
+    bucket = client.bucket(GCS_BUCKET)
+    bucket.blob(SNAPSHOT_BLOB).upload_from_string(body, content_type="application/json")
+    bucket.blob(SNAPSHOT_NDJSON_BLOB).upload_from_string(ndjson, content_type="application/x-ndjson")
+    logger.info(f"Saved to GCS: {SNAPSHOT_BLOB}, {SNAPSHOT_NDJSON_BLOB} (updated_at={data.get('updated_at')})")
     return data.get("updated_at")
 
 
 def fetch_channel_data(channel_id, channel_name, view_date):
-    """チャンネルデータを取得してGCSに保存し、取得した行を返す（失敗時は None）"""
+    """チャンネルデータを取得してGCSに保存する（成功時 True、失敗時 False）"""
     try:
         logger.info(f"Processing {channel_name}...")
         playlist_id = get_channel_uploads_playlist_id(channel_id)
@@ -164,57 +168,14 @@ def fetch_channel_data(channel_id, channel_name, view_date):
         video_stats = get_video_statistics(video_ids)
         for st in video_stats:
             st["view_date"] = view_date
+            st["channel"] = channel_name
 
         filename = f"{channel_name}_video_statistics_{view_date}.csv"
         save_to_gcs(channel_name, filename, video_stats)
-        return video_stats
+        return True
     except Exception as e:
         logger.error(f"Error processing {channel_name}: {str(e)}")
-        return None
-
-
-def to_bq_rows(channel_name, video_stats):
-    """CSV 用の行（値は文字列）を BigQuery 用の行に変換する（channel を付け、数値と日付を型付け）"""
-    return [
-        {
-            "channel": channel_name,
-            "videoId": st["videoId"],
-            "viewCount": int(st["viewCount"]),
-            "likeCount": int(st["likeCount"]),
-            "commentCount": int(st["commentCount"]),
-            "videoURL": st["videoURL"],
-            "thumbnail": st["thumbnail"],
-            "view_date": datetime.datetime.strptime(st["view_date"], "%Y%m%d").date().isoformat(),
-        }
-        for st in video_stats
-    ]
-
-
-def load_to_bigquery(rows_by_channel, view_date):
-    """取得できたチャンネルの view_date 分を BigQuery で置き換える。
-
-    先に「その日・そのチャンネル」の行を消してから追加するので、リトライしても重複しない。
-    失敗したチャンネルの行は触らない（前の試行で入った分が残る）。
-    """
-    client = bigquery.Client()
-    day = datetime.datetime.strptime(view_date, "%Y%m%d").date()
-    channels = list(rows_by_channel)
-
-    client.query(
-        f"DELETE FROM `{BQ_TABLE}` WHERE view_date = @day AND channel IN UNNEST(@channels)",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("day", "DATE", day),
-            bigquery.ArrayQueryParameter("channels", "STRING", channels),
-        ]),
-    ).result()
-
-    rows = [r for ch in channels for r in to_bq_rows(ch, rows_by_channel[ch])]
-    client.load_table_from_json(
-        rows, BQ_TABLE,
-        job_config=bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_APPEND),
-    ).result()
-    logger.info(f"Loaded to BigQuery: {len(rows)} rows ({view_date}, {len(channels)} channels)")
-    return len(rows)
+        return False
 
 
 @functions_framework.http
@@ -229,22 +190,9 @@ def main(request):
         if not channels:
             return {"error": "No channels loaded"}, 400
 
-        fetched = {}
+        results = {}
         for cid, cname in channels:
-            rows = fetch_channel_data(cid, cname, view_date)
-            if rows is not None:
-                fetched[cname] = rows
-        results = {cname: cname in fetched for _, cname in channels}
-
-        # 取得できたチャンネルだけ読み込む。失敗したら 500 を返し、Scheduler のリトライでやり直す
-        bq_rows = 0
-        bq_ok = True
-        if fetched:
-            try:
-                bq_rows = load_to_bigquery(fetched, view_date)
-            except Exception as e:
-                logger.error(f"Error loading to BigQuery: {str(e)}")
-                bq_ok = False
+            results[cname] = fetch_channel_data(cid, cname, view_date)
 
         # 動画マスタのコピーは統計とは独立。失敗しても統計の取得はやり直さない
         # （ステータスは統計の結果だけで決め、失敗は ERROR ログ → アラートで気づく）
@@ -254,15 +202,14 @@ def main(request):
             logger.error(f"Error copying snapshot: {str(e)}")
             snapshot_updated_at = None
 
-        ok = len(fetched)
+        ok = sum(1 for v in results.values() if v)
         dur = (datetime.datetime.now() - start).total_seconds()
-        logger.info(f"[END] {ok}/{len(channels)} channels, {bq_rows} rows to BigQuery ({dur:.2f}s)")
+        logger.info(f"[END] {ok}/{len(channels)} channels ({dur:.2f}s)")
 
-        status = 200 if ok == len(channels) and bq_ok else 500
+        status = 200 if ok == len(channels) else 500
         return {
             "message": f"Stats: {ok}/{len(channels)} completed",
             "results": results,
-            "bq_rows": bq_rows,
             "snapshot_updated_at": snapshot_updated_at,
             "duration_seconds": dur,
         }, status
