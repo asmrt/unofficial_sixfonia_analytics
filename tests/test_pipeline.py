@@ -1,8 +1,8 @@
 """pipeline/（GCP の日次収集パイプライン）のテスト。
 
 Cloud Functions の main.py は import 時に YouTube API クライアントを作り、
-google-cloud-storage / google-cloud-bigquery / functions-framework にも依存する。CI にはそれらが無いので、
-import の間だけ偽物のモジュールに差し替えて読み込み、API・GCS・BigQuery は偽物で置き換える。
+google-cloud-storage / functions-framework にも依存する。CI にはそれらが無いので、
+import の間だけ偽物のモジュールに差し替えて読み込み、API・GCS は偽物で置き換える。
 """
 
 import csv
@@ -37,11 +37,8 @@ def _stub_modules():
 
     storage = types.ModuleType("google.cloud.storage")
     storage.Client = mock.MagicMock(name="Client")
-    bigquery = types.ModuleType("google.cloud.bigquery")
-    bigquery.Client = mock.MagicMock(name="BigQueryClient")
     cloud = types.ModuleType("google.cloud")
     cloud.storage = storage
-    cloud.bigquery = bigquery
     google = types.ModuleType("google")
     google.cloud = cloud
 
@@ -52,7 +49,6 @@ def _stub_modules():
         "google": google,
         "google.cloud": cloud,
         "google.cloud.storage": storage,
-        "google.cloud.bigquery": bigquery,
     }
 
 
@@ -60,7 +56,7 @@ def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path / "main.py")
     module = importlib.util.module_from_spec(spec)
     with mock.patch.dict(sys.modules, _stub_modules()), \
-            mock.patch.dict("os.environ", {"YOUTUBE_API_KEY": "dummy", "BQ_TABLE": "p.d.video_statistics",
+            mock.patch.dict("os.environ", {"YOUTUBE_API_KEY": "dummy",
                                  "SNAPSHOT_URL": "https://example.com/videos.json"}):
         spec.loader.exec_module(module)
     return module
@@ -117,45 +113,20 @@ def fake_storage():
     return types.SimpleNamespace(Client=Client), uploaded
 
 
-def fake_bigquery():
-    """実行されたクエリ・読み込みを記録する偽の BigQuery"""
-    calls = []
-
-    class Job:
-        def result(self):
-            return None
-
-    class Client:
-        def query(self, sql, job_config=None):
-            calls.append(("query", sql, job_config.params))
-            return Job()
-
-        def load_table_from_json(self, rows, table, job_config=None):
-            calls.append(("load", table, rows, job_config.write_disposition))
-            return Job()
-
-    class QueryJobConfig:
-        def __init__(self, query_parameters):
-            self.params = {p[0]: p[1:] for p in query_parameters}
-
-    class LoadJobConfig:
-        def __init__(self, write_disposition):
-            self.write_disposition = write_disposition
-
-    module = types.SimpleNamespace(
-        Client=Client,
-        QueryJobConfig=QueryJobConfig,
-        LoadJobConfig=LoadJobConfig,
-        ScalarQueryParameter=lambda name, typ, value: (name, typ, value),
-        ArrayQueryParameter=lambda name, typ, values: (name, typ, values),
-        WriteDisposition=types.SimpleNamespace(WRITE_APPEND="WRITE_APPEND"),
-    )
-    return module, calls
-
-
-def stat_row(vid="v1", view_date="20260918"):
+def stat_row(vid="v1", view_date="20260918", channel="lan"):
     return {"videoId": vid, "viewCount": "10", "likeCount": "2", "commentCount": "1",
-            "videoURL": f"https://www.youtube.com/watch?v={vid}", "thumbnail": "t", "view_date": view_date}
+            "videoURL": f"https://www.youtube.com/watch?v={vid}", "thumbnail": "t",
+            "view_date": view_date, "channel": channel}
+
+
+def _parse_create_table_columns(sql_text, table_index=0):
+    """01_create_external_tables.sql から table_index 番目の CREATE 文の列名一覧を取る"""
+    starts = [m.start() for m in re.finditer(r"CREATE OR REPLACE EXTERNAL TABLE", sql_text)]
+    start = starts[table_index]
+    end = starts[table_index + 1] if table_index + 1 < len(starts) else len(sql_text)
+    stmt = sql_text[start:end]
+    body = stmt[stmt.index("(") + 1:stmt.index(")\nOPTIONS")]
+    return re.findall(r"^\s*(\w+)\s+(?:STRING|INT64|BOOL|TIMESTAMP|ARRAY)", body, flags=re.M)
 
 
 # ---- チャンネル定義 ------------------------------------------------------
@@ -196,53 +167,42 @@ def test_get_video_statistics_batches_by_50_and_defaults_missing_counts(stats):
     assert rows[1]["videoURL"] == "https://www.youtube.com/watch?v=v1"
 
 
-def test_save_to_gcs_writes_csv_with_view_date_last(stats):
+def test_save_to_gcs_writes_csv_with_channel_last(stats):
     storage, uploaded = fake_storage()
     stats.storage = storage
-    row = {"videoId": "v1", "viewCount": "10", "likeCount": "2", "commentCount": "1",
-           "videoURL": "https://www.youtube.com/watch?v=v1", "thumbnail": "t", "view_date": "20260918"}
+    row = stat_row()
 
     stats.save_to_gcs("lan", "lan_video_statistics_20260918.csv", [row])
 
     body = uploaded["lan/lan_video_statistics_20260918.csv"]
     header, first = list(csv.reader(io.StringIO(body)))
-    assert header == ["videoId", "viewCount", "likeCount", "commentCount", "videoURL", "thumbnail", "view_date"]
-    assert first[-1] == "20260918"
+    assert header == ["videoId", "viewCount", "likeCount", "commentCount", "videoURL",
+                       "thumbnail", "view_date", "channel"]
+    assert first[-1] == "lan"
+    assert first[-2] == "20260918"
 
 
-def test_bq_rows_match_table_columns(stats):
-    """BigQuery に読み込む行の列と、テーブル定義（sql/01）の列がずれていない"""
-    ddl = (PIPELINE / "sql" / "01_create_table.sql").read_text(encoding="utf-8")
-    body = ddl[ddl.index("(") + 1:ddl.index(")\nPARTITION BY")]
-    table_cols = re.findall(r"^\s*(\w+)\s+(?:STRING|INT64|DATE)", body, flags=re.M)
+def test_csv_header_matches_ext_video_statistics_columns():
+    """CSV の列順と、外部テーブル定義（sql/01, ext_video_statistics）の列がずれていない"""
+    ddl = (PIPELINE / "sql" / "01_create_external_tables.sql").read_text(encoding="utf-8")
+    table_cols = _parse_create_table_columns(ddl, table_index=0)
 
-    row = stats.to_bq_rows("lan", [stat_row()])[0]
-
-    assert list(row) == table_cols
+    assert table_cols == ["videoId", "viewCount", "likeCount", "commentCount", "videoURL",
+                           "thumbnail", "view_date", "channel"]
 
 
-def test_to_bq_rows_types_counts_and_date(stats):
-    row = stats.to_bq_rows("lan", [stat_row(view_date="20260918")])[0]
+def test_ext_videos_columns_are_keys_of_a_video_dict():
+    """ext_videos（sql/01 の2つ目の CREATE）の全列が、動画マスタの動画1件分に含まれている"""
+    ddl = (PIPELINE / "sql" / "01_create_external_tables.sql").read_text(encoding="utf-8")
+    table_cols = _parse_create_table_columns(ddl, table_index=1)
 
-    assert row["channel"] == "lan"
-    assert (row["viewCount"], row["likeCount"], row["commentCount"]) == (10, 2, 1)
-    assert row["view_date"] == "2026-09-18"
+    sample_video = {"videoId": "v1", "channel": "lan", "title": "タイトル",
+                     "publishedAt": "2026-09-18T00:00:00Z", "durationSec": 120,
+                     "isShort": False, "thumbnail": "t", "tags": ["a"], "available": True}
 
-
-def test_load_to_bigquery_deletes_the_day_then_appends(stats):
-    """その日・取得できたチャンネルの行だけを消してから追加する（リトライしても重複しない）"""
-    bq, calls = fake_bigquery()
-    stats.bigquery = bq
-
-    n = stats.load_to_bigquery({"lan": [stat_row("v1"), stat_row("v2")], "hima72": [stat_row("v3")]}, "20260918")
-
-    assert n == 3
-    (kind, sql, params), (kind2, table, rows, disposition) = calls
-    assert kind == "query" and sql.startswith("DELETE FROM `p.d.video_statistics`")
-    assert params["day"] == ("DATE", datetime.date(2026, 9, 18))
-    assert params["channels"] == ("STRING", ["lan", "hima72"])
-    assert kind2 == "load" and table == "p.d.video_statistics" and disposition == "WRITE_APPEND"
-    assert [r["videoId"] for r in rows] == ["v1", "v2", "v3"]
+    assert table_cols
+    for col in table_cols:
+        assert col in sample_video
 
 
 def test_main_uses_yesterday_in_jst_and_returns_500_on_partial_failure(stats):
@@ -257,14 +217,12 @@ def test_main_uses_yesterday_in_jst_and_returns_500_on_partial_failure(stats):
     stats.datetime = types.SimpleNamespace(datetime=FixedDatetime, timedelta=datetime.timedelta)
     stats.load_channels = lambda: [("c1", "ok"), ("c2", "ng")]
     seen = []
-    loaded = []
 
     def fetch(cid, cname, view_date):
         seen.append(view_date)
-        return [stat_row()] if cname == "ok" else None
+        return cname == "ok"
 
     stats.fetch_channel_data = fetch
-    stats.load_to_bigquery = lambda rows, view_date: loaded.append((sorted(rows), view_date)) or 1
     stats.copy_snapshot_to_gcs = lambda: "2026-09-19T02:21:52+09:00"
 
     body, status = stats.main(None)
@@ -272,49 +230,35 @@ def test_main_uses_yesterday_in_jst_and_returns_500_on_partial_failure(stats):
     assert seen == ["20260918", "20260918"]
     assert status == 500
     assert body["results"] == {"ok": True, "ng": False}
-    # 取得できたチャンネルだけは読み込む（リトライで残りが埋まる）
-    assert loaded == [(["ok"], "20260918")]
 
 
-def test_main_returns_500_when_bigquery_load_fails(stats):
-    stats.load_channels = lambda: [("c1", "ok")]
-    stats.fetch_channel_data = lambda cid, cname, view_date: [stat_row()]
-    stats.copy_snapshot_to_gcs = lambda: None
-
-    def boom(rows, view_date):
-        raise RuntimeError("bq down")
-
-    stats.load_to_bigquery = boom
-
-    body, status = stats.main(None)
-
-    assert status == 500
-    assert body["results"] == {"ok": True}
-    assert body["bq_rows"] == 0
-
-
-def test_main_skips_bigquery_when_every_channel_fails(stats):
-    """全チャンネル失敗なら BigQuery を触らない（前の試行で入った分を消さない）"""
-    stats.load_channels = lambda: [("c1", "a"), ("c2", "b")]
-    stats.fetch_channel_data = lambda cid, cname, view_date: None
-    stats.copy_snapshot_to_gcs = lambda: None
-    stats.load_to_bigquery = mock.MagicMock()
-
-    body, status = stats.main(None)
-
-    assert status == 500
-    stats.load_to_bigquery.assert_not_called()
-
-
-def test_fetch_channel_data_returns_none_on_api_error(stats):
+def test_fetch_channel_data_returns_false_on_api_error(stats):
     def boom(_):
         raise ValueError("No channel found")
 
     stats.get_channel_uploads_playlist_id = boom
-    assert stats.fetch_channel_data("c", "lan", "20260918") is None
+    assert stats.fetch_channel_data("c", "lan", "20260918") is False
 
 
-# ---- 動画マスタ（videos.json）のコピー --------------------------------
+def test_fetch_channel_data_sets_channel_and_view_date_on_every_row(stats):
+    stats.get_channel_uploads_playlist_id = lambda channel_id: "PL1"
+    stats.get_videos_from_playlist = lambda playlist_id: ["v1", "v2"]
+    stats.get_video_statistics = lambda video_ids: [
+        {"videoId": vid, "viewCount": "1", "likeCount": "0", "commentCount": "0",
+         "videoURL": f"https://www.youtube.com/watch?v={vid}", "thumbnail": ""}
+        for vid in video_ids
+    ]
+    saved = {}
+    stats.save_to_gcs = lambda channel_name, filename, data: saved.update(rows=data)
+
+    assert stats.fetch_channel_data("c1", "lan", "20260918") is True
+    assert len(saved["rows"]) == 2
+    for row in saved["rows"]:
+        assert row["channel"] == "lan"
+        assert row["view_date"] == "20260918"
+
+
+# ---- 動画マスタ（videos.json / videos.ndjson）のコピー --------------------
 
 class FakeResponse(io.BytesIO):
     def __enter__(self):
@@ -328,15 +272,19 @@ def _serve(monkeypatch, stats, body):
     monkeypatch.setattr(stats.urllib.request, "urlopen", lambda url, timeout: FakeResponse(body))
 
 
-def test_copy_snapshot_saves_body_as_is(stats, monkeypatch):
-    body = json.dumps({"updated_at": "2026-09-19T02:21:52+09:00",
-                       "videos": [{"videoId": "v1", "title": "タイトル"}]}, ensure_ascii=False).encode("utf-8")
+def test_copy_snapshot_writes_json_as_is_and_ndjson_one_line_per_video(stats, monkeypatch):
+    videos = [{"videoId": "v1", "title": "タイトル"}, {"videoId": "v2", "title": "その2"}]
+    body = json.dumps({"updated_at": "2026-09-19T02:21:52+09:00", "videos": videos},
+                       ensure_ascii=False).encode("utf-8")
     _serve(monkeypatch, stats, body)
     storage, uploaded = fake_storage()
     stats.storage = storage
 
     assert stats.copy_snapshot_to_gcs() == "2026-09-19T02:21:52+09:00"
     assert uploaded["master/videos.json"] == body
+
+    ndjson_lines = uploaded["master/videos.ndjson"].splitlines()
+    assert [json.loads(line) for line in ndjson_lines] == videos
 
 
 @pytest.mark.parametrize("body", [
@@ -345,7 +293,7 @@ def test_copy_snapshot_saves_body_as_is(stats, monkeypatch):
     b'{"updated_at": "x"}',
     b"[]",
 ])
-def test_copy_snapshot_rejects_invalid_body_without_overwriting(stats, monkeypatch, body):
+def test_copy_snapshot_rejects_invalid_body_without_writing_anything(stats, monkeypatch, body):
     _serve(monkeypatch, stats, body)
     storage, uploaded = fake_storage()
     stats.storage = storage
@@ -357,8 +305,7 @@ def test_copy_snapshot_rejects_invalid_body_without_overwriting(stats, monkeypat
 
 def test_main_snapshot_failure_does_not_fail_stats(stats):
     stats.load_channels = lambda: [("c1", "ok")]
-    stats.fetch_channel_data = lambda cid, cname, view_date: [stat_row()]
-    stats.load_to_bigquery = lambda rows, view_date: 1
+    stats.fetch_channel_data = lambda cid, cname, view_date: True
 
     def boom():
         raise OSError("network down")

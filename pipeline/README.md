@@ -11,24 +11,25 @@ YouTube Data API v3
       │
       └─ [youtube-data-fetch]   毎日の再生数・いいね数を取得（01:00 JST）
                │
-               ├──→ GCS {channel}/*.csv      統計データ（日次・生データの保管）
-               ├──→ BigQuery video_statistics 同じデータを読み込み（その日・そのチャンネル分を置き換え）
-               └──→ GCS master/videos.json   動画マスタのコピー（毎日上書き）
+               ├──→ GCS {channel}/*.csv          統計データ（channel列つき。ここが唯一のデータ保管場所）
+               ├──→ GCS master/videos.json       動画マスタのコピー（毎日上書き）
+               └──→ GCS master/videos.ndjson     動画マスタを1行1動画にした NDJSON（BigQuery 外部テーブル用）
                         ↑
                公開URL（SNAPSHOT_URL）の videos.json を取得（YouTube API は使わない）
                         ↑
                動画マスタの生成（別システム）
 
-BigQuery
-  ├─ video_statistics             日次スナップショット（view_date で日付パーティション）
-  └─ video_statistics_with_diff   view_diff（直前の計測日との差）をその場で計算するビュー
+BigQuery（データは持たず GCS を直接読む）
+  ├─ ext_video_statistics / ext_videos              外部テーブル（GCS の CSV・NDJSON をそのまま読む）
+  └─ video_statistics / video_statistics_with_diff / videos
+       スネークケースの列名に変換したビュー（video_statistics_with_diff は view_diff もその場で計算）
 ```
 
-取得から BigQuery への読み込みまでを 1 つの関数で行う。スケジュールクエリや外部テーブルは使わない
-（別時刻に動く処理を持たないので、関数のリトライが何時に終わっても取りこぼさない）。
+関数は GCS への書き込みだけを行い、BigQuery には一切触らない。BigQuery 側は外部テーブルとビューのみで、
+CSV・NDJSON を差し替えれば次のクエリから反映される（移し替え処理・スケジュールクエリは無い）。
 
 > Colab ノートブックで手動で行っている日次収集を自動化するためのもの。当面は既存の Colab 運用と並行して動かす。
-> 既存の Colab 運用とは出力先も CSV の列も異なる（既存: 別バケット・6列 / 本パイプライン: `youtube-metrics-bucket`・`thumbnail` を加えた7列）。
+> 既存の Colab 運用とは出力先も CSV の列も異なる（既存: 別バケット・6列 / 本パイプライン: `youtube-metrics-bucket`・`thumbnail` と `channel` を加えた8列。列名は既存と同じ）。
 > 既存の分析をこちらの出力に切り替える方法は未決定（[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) を参照）。
 
 ### リポジトリ構成
@@ -41,8 +42,8 @@ pipeline/
 │   ├── IMPROVEMENTS.md                  今後の改善点・未決事項
 │   └── legacy_implementation_guide.md   旧実装ガイド（参照用）
 ├── sql/
-│   ├── 01_create_table.sql              日次スナップショットのテーブル作成 DDL
-│   └── 02_create_view.sql               前日比（view_diff）のビュー作成 DDL
+│   ├── 01_create_external_tables.sql     GCS を直接読む外部テーブル作成 DDL
+│   └── 02_create_views.sql               スネークケース変換・前日比（view_diff）のビュー作成 DDL
 └── youtube-data-fetch/                  Cloud Function: 統計取得 ＋ 動画マスタのコピー
     ├── main.py
     ├── requirements.txt
@@ -59,11 +60,12 @@ pipeline/
 
 | コンポーネント | 種別 | 役割 |
 |---|---|---|
-| `youtube-data-fetch` | Cloud Functions (gen2) | 動画統計情報（再生数等）の日次取得・GCS保存・BigQuery 読み込み、動画マスタのコピー（01:00 JST） |
+| `youtube-data-fetch` | Cloud Functions (gen2) | 動画統計情報（再生数等）の日次取得・GCS保存、動画マスタのコピー（01:00 JST）。BigQuery には触れない |
 | 動画マスタ（`videos.json`） | 別システム | 毎日生成され、公開URLで配信される。本パイプラインはコピーするだけ |
-| GCS バケット | Cloud Storage | CSV/JSON の保管（生データ。BigQuery を作り直すときの元にもなる） |
-| `video_statistics` | BigQuery テーブル | 日次スナップショットの蓄積（`sql/01`） |
-| `video_statistics_with_diff` | BigQuery ビュー | `view_diff`・`diff_days` を足したビュー。分析はこちらを読む（`sql/02`） |
+| GCS バケット | Cloud Storage | CSV/JSON/NDJSON の保管。唯一のデータ保管場所（BigQuery はここを直接読む） |
+| `ext_video_statistics` / `ext_videos` | BigQuery 外部テーブル | GCS の CSV・NDJSON をそのまま読む（`sql/01`） |
+| `video_statistics` / `videos` | BigQuery ビュー | 外部テーブルの列名をスネークケースに変換（`sql/02`） |
+| `video_statistics_with_diff` | BigQuery ビュー | `video_statistics` に `view_diff`・`diff_days` を足したビュー。分析はこちらを読む（`sql/02`） |
 | Cloud Scheduler | Cloud Scheduler | Function を OIDC 認証付き HTTP で起動 |
 
 ### 対象チャンネル
@@ -85,7 +87,7 @@ pipeline/
 
 ### 概要
 
-チャンネルごとの全動画の再生数・いいね数・コメント数を毎日取得し、GCS に CSV として保存したうえで、BigQuery に読み込む。
+チャンネルごとの全動画の再生数・いいね数・コメント数を毎日取得し、GCS に CSV として保存する。BigQuery への読み込みは行わない。
 
 ### 処理フロー
 
@@ -100,7 +102,6 @@ main(request)
   │     ├─ get_videos_from_playlist()           動画ID一覧取得（ページネーション対応）
   │     ├─ get_video_statistics()               統計情報取得（50件ずつバッチ）
   │     └─ save_to_gcs()                        CSV保存
-  ├─ load_to_bigquery()            取得できたチャンネル分を BigQuery に読み込み（1件も取れなければ呼ばない）
   └─ copy_snapshot_to_gcs()        動画マスタのコピー（失敗しても統計の結果には影響しない）
 ```
 
@@ -113,10 +114,8 @@ main(request)
 | `get_videos_from_playlist(playlist_id)` | str | `list[str]` | プレイリストから全動画IDを取得（ページネーション） |
 | `get_video_statistics(video_ids)` | `list[str]` | `list[dict]` | 動画統計情報を50件ずつバッチ取得 |
 | `save_to_gcs(channel_name, filename, data)` | — | — | CSV形式でGCSに保存 |
-| `fetch_channel_data(channel_id, channel_name, view_date)` | — | `list[dict] \| None` | チャンネル1件分の取得と CSV 保存。取得した行を返す（失敗時は None） |
-| `to_bq_rows(channel_name, video_stats)` | — | `list[dict]` | CSV 用の行を BigQuery 用に変換（channel を付け、数値・日付を型付け） |
-| `load_to_bigquery(rows_by_channel, view_date)` | `dict[str, list]`, str | int | その日・そのチャンネルの行を消してから追加。戻り値は読み込んだ行数 |
-| `copy_snapshot_to_gcs()` | — | str | 動画マスタを公開URLから取得して GCS に上書き保存。戻り値は `updated_at` |
+| `fetch_channel_data(channel_id, channel_name, view_date)` | — | bool | チャンネル1件分の取得と CSV 保存。成功時 True、失敗時 False |
+| `copy_snapshot_to_gcs()` | — | str | 動画マスタを公開URLから取得して `videos.json`・`videos.ndjson` を GCS に上書き保存。戻り値は `updated_at` |
 | `main(request)` | HTTP Request | `dict, int` | Cloud Functionエントリーポイント |
 
 ### GCS 保存先
@@ -136,24 +135,21 @@ gs://{GCS_BUCKET}/{channel_name}/{channel_name}_video_statistics_{YYYYMMDD}.csv
 | videoURL | str | 動画URL |
 | thumbnail | str | サムネイルURL |
 | view_date | str | 計測日 (YYYYMMDD, JST, 実行日の前日) |
+| channel | str | チャンネル名（channels.json の name） |
 
-### BigQuery への読み込み
+外部テーブル `ext_video_statistics`（`sql/01`）はこの列を**位置**で読むため、列の並びを変える場合は SQL 側も合わせて変更する。
 
-GCS に書いたのと同じ行に `channel` を付け、`viewCount` などを整数、`view_date` を DATE にして読み込む。
+### BigQuery（外部テーブル＋ビュー）
 
-```text
-取得できたチャンネルの行（メモリ上）
-  ├─ DELETE  video_statistics WHERE view_date = 前日 AND channel IN (取得できたチャンネル)
-  └─ 読み込みジョブ（追記）
-```
+BigQuery はデータを持たず、GCS の CSV・NDJSON を外部テーブルとして直接読む。
 
-- リトライしても重複しない（同じ日・同じチャンネルの行は先に消える）
-- 取得に失敗したチャンネルの行は触らない。前の試行で入った分は残り、次のリトライで置き換わる
-- 読み込みに失敗したら ERROR ログを出して 500 を返す（Scheduler がリトライする）
-- DELETE と読み込みは別ジョブなので、その間に失敗すると一時的にそのチャンネルの行が消えた状態になる。500 を返すのでリトライで戻る
+- `ext_video_statistics`: `gs://{GCS_BUCKET}/*.csv` を読む外部テーブル（`master/` 配下の JSON・NDJSON はマッチしない）
+- `ext_videos`: `gs://{GCS_BUCKET}/master/videos.ndjson` を読む外部テーブル
+- `video_statistics` / `videos`: 上記2つの列名をスネークケース（`video_id`, `view_count` など）に変換するビュー
+- `video_statistics_with_diff`: `video_statistics` に `view_diff`（直前の計測日との差）・`diff_days`（何日前との差か）を足したビュー。分析はこちらを読む
 
-`view_diff`（前日比）は保存せず、ビュー `video_statistics_with_diff` が `LAG` で直前の計測日との差を計算する。
-欠けた日があっても次の日の値が出る（`diff_days` が 2 以上になる）。
+CSV・NDJSON を GCS 上で差し替えれば、次にビューへクエリを投げたときから内容が反映される（読み込みジョブ・スケジュールクエリは無い）。
+`view_diff`（前日比）は保存せず、ビューが `LAG` で直前の計測日との差を計算する。欠けた日があっても次の日の値が出る（`diff_days` が 2 以上になる）。
 
 ---
 
@@ -165,15 +161,17 @@ GCS に書いたのと同じ行に `channel` を付け、`viewCount` などを�
 ほかの用途でも同じ `videos.json` が使われているため、生成元を GCP 側に増やすと内容が食い違う。
 
 本パイプラインは、`youtube-data-fetch` の実行時に公開URL（環境変数 `SNAPSHOT_URL`）の `videos.json` を取得し、GCS にそのままコピーする。
-BigQuery でランキングにタイトルを付けたい場合は、このコピーを読む（IMPROVEMENTS.md の #5）。
+あわせて、`videos` 配列を1行1動画の NDJSON に変換した `videos.ndjson` も書く（BigQuery の外部テーブル `ext_videos` が読む形式のため）。
+BigQuery でランキングにタイトルを付けたい場合は、ビュー `videos` を読む。
 
 ### 保存先
 
 ```text
-gs://{GCS_BUCKET}/master/videos.json    （毎日上書き。中身は公開URLの videos.json と同一）
+gs://{GCS_BUCKET}/master/videos.json      （毎日上書き。中身は公開URLの videos.json と同一）
+gs://{GCS_BUCKET}/master/videos.ndjson    （毎日上書き。videos 配列を1行1動画にしたもの。キーは変換しない）
 ```
 
-中身は `{"updated_at": ..., "channels": [...], "videos": [...]}` 形式の1つの JSON オブジェクト。
+`videos.json` の中身は `{"updated_at": ..., "channels": [...], "videos": [...]}` 形式の1つの JSON オブジェクト。
 
 ### 注意点
 
@@ -192,7 +190,6 @@ gs://{GCS_BUCKET}/master/videos.json    （毎日上書き。中身は公開URL�
 |---|---|---|---|
 | `YOUTUBE_API_KEY` | **必須** | — | YouTube Data API v3 キー。Secret Manager（`youtube-api-key`）から `--set-secrets` でマウント。未設定時は起動時に `RuntimeError` |
 | `GCS_BUCKET` | 任意 | `youtube-metrics-bucket` | GCSバケット名 |
-| `BQ_TABLE` | **必須** | — | 読み込み先テーブル（`project.dataset.video_statistics`）。プロジェクトIDをリポジトリに書かないため、デプロイ時に渡す。未設定時は起動時に `RuntimeError` |
 | `SNAPSHOT_URL` | **必須** | — | 動画マスタ（`videos.json`）の公開URL。デプロイ時に渡す。未設定時は起動時に `RuntimeError` |
 
 ### ログ出力
@@ -217,20 +214,17 @@ view_date = (datetime.datetime.now(JST) - datetime.timedelta(days=1)).strftime("
 
 | ケース | 挙動 |
 |---|---|
-| `YOUTUBE_API_KEY` / `BQ_TABLE` / `SNAPSHOT_URL` 未設定 | 起動時に `RuntimeError`（fail-fast） |
+| `YOUTUBE_API_KEY` / `SNAPSHOT_URL` 未設定 | 起動時に `RuntimeError`（fail-fast） |
 | `channels.json` 読み込み失敗（欠落/破損） | 例外を上位に伝播 → 500レスポンス |
 | `channels.json` の `channels` が空配列 | `[]` 返却 → 400レスポンス |
 | チャンネルIDが無効 | `ValueError` → チャンネルをスキップ、他チャンネルは継続 |
-| 一部チャンネル失敗 | 取得できた分は BigQuery に読み込み、500レスポンス（スケジューラがリトライ） |
-| 全チャンネル失敗 | BigQuery には触らず、500レスポンス |
-| BigQuery への読み込み失敗 | ERROR ログ、500レスポンス（スケジューラがリトライ） |
+| 一部チャンネル失敗 | 取得できたチャンネルの CSV だけ保存済み、500レスポンス（スケジューラがリトライ） |
 | 動画マスタのコピー失敗 | ERROR ログのみ。GCS 上の前回分は残り、関数のステータスには影響しない |
 
 ### 依存ライブラリ
 
 ```text
 functions-framework==3.10.2
-google-cloud-bigquery==3.45.2
 google-cloud-storage==3.10.1
 google-api-python-client==2.196.0
 protobuf>=6.33.5,<7.0
