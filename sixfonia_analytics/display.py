@@ -6,6 +6,15 @@ import pandas as pd
 from IPython.display import HTML, display
 
 
+def _first_valid(row, *cols):
+    """行から最初の非欠損値を返す（NaNは真値扱いされるため or では判定できない）。"""
+    for col in cols:
+        val = row.get(col)
+        if val is not None and pd.notna(val):
+            return val
+    return None
+
+
 def display_ranking_cards(df: pd.DataFrame, metric_col: str, title: str,
                           top_n: int = 10) -> None:
     """サムネ付きカード形式のランキング（旧06）。"""
@@ -17,7 +26,7 @@ def display_ranking_cards(df: pd.DataFrame, metric_col: str, title: str,
                 <p><b>{row.get('video_title', row['videoId'])}</b></p>
                 <p style='font-size:.85em;color:#666'>{row['videoId']}</p>
                 <p><b>{label}:</b> {row[metric_col]:,.0f}</p>
-                <img src='{row.get('thumbnail_url') or row.get('thumbnailURL')}'
+                <img src='{_first_valid(row, 'thumbnail_url', 'thumbnailURL')}'
                      width='160' height='90' style='border-radius:3px'>
             </div>"""
         for _, row in ranked.iterrows()
@@ -27,21 +36,27 @@ def display_ranking_cards(df: pd.DataFrame, metric_col: str, title: str,
 
 
 def display_ranking_table(df: pd.DataFrame, title: str, metric_col: str = "viewCount_difference",
-                          top_n: int = 10) -> None:
-    """順位・サムネ・タイトルリンク付きのランキングテーブル（旧07）。"""
+                          top_n: int = 10, sort_col: str | None = None) -> None:
+    """順位・サムネ・タイトルリンク付きのランキングテーブル（旧07）。
+
+    metric_col: 表に数値表示する列。
+    sort_col  : 順位付けに使う列（省略時は metric_col）。急増スコアのように
+                「スコア順に並べつつ表示は増加数」の場合に指定する。
+    """
     if df.empty:
         print(f"{title}: (該当なし)")
         return
-    rank_df = df.sort_values(metric_col, ascending=False).head(top_n).reset_index(drop=True)
+    rank_df = (df.sort_values(sort_col or metric_col, ascending=False)
+               .head(top_n).reset_index(drop=True))
 
     rows_html = ""
     for idx, row in rank_df.iterrows():
-        thumb = row.get("thumbnailURL") or row.get("thumbnail_url")
-        thumb_html = f'<img src="{thumb}" width="80">' if pd.notna(thumb) else ""
+        thumb = _first_valid(row, "thumbnailURL", "thumbnail_url")
+        thumb_html = f'<img src="{thumb}" width="80">' if thumb else ""
         vtitle = row.get("video_title") or row.get("videoTitle_latest") or row["videoId"]
         link = (f'<a href="https://www.youtube.com/watch?v={row["videoId"]}" target="_blank" '
                 f'style="text-decoration:none;color:#1f77b4;font-weight:500;">{str(vtitle)[:55]}</a>')
-        metric = f'<span style="color:#d62728;font-weight:bold;">+{int(row[metric_col]):,}</span>' \
+        metric = f'<span style="color:#d62728;font-weight:bold;">{int(row[metric_col]):+,}</span>' \
             if pd.notna(row[metric_col]) else "N/A"
         vtype = row.get("video_type", "")
         badge = ""

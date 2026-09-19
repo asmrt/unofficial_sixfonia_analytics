@@ -32,14 +32,41 @@ token = userdata.get("GITHUB_TOKEN")
 | `04_x_content/quiz_graph` | Xクイズ出題/回答用・ブログ用グラフ画像 | 随時 |
 | `04_x_content/quiz_answer_card` | サムネ付き回答発表/ピックアップカード画像 | 随時 |
 
+### 企画・単発の分析
+
+| ノートブック | 用途 |
+|---|---|
+| `03_analyze/anniversary_year1` | 周年企画: 1年目に投稿された動画の、指定年の再生数の伸びランキングと再生リスト別のジャンル集計（CSV出力）。BigQuery 版のたたき台は `anniversary_year1_ranking.sql` |
+| `03_analyze/video_playlist_map` | 1チャンネル分の「動画 × 再生リスト」対応表（TSV出力）。パッケージに依存しない単体ノートブック |
+| `04_x_content/ranking_top10_image` | 再生リストごとの再生数の伸び TOP10 を X 投稿用画像にして ZIP でまとめて出力。仕様は `ranking_top10_spec.md` |
+
+## パッケージ構成（`sixfonia_analytics/`）
+
+| モジュール | 役割 |
+|---|---|
+| `config` | チャンネル定義・パス・ファイル名規則 |
+| `auth` | API キーの読み込み（Colab Secrets / 環境変数） |
+| `collect` / `maintain` | 日次統計の収集、過去 CSV の整備 |
+| `load` / `enrich` | CSV の読み込み、動画タイトルなどの付与 |
+| `metrics` | 差分・月次増加量・期間の増加量（`period_gains`）・上昇率 |
+| `playlists` | 公開再生リストの取得と、再生リスト名によるジャンル分類 |
+| `display` / `plots` / `cards` | ランキング表示、グラフ、カード画像 |
+| `comment` | コメント取得・単語頻度 |
+
 ## データ配置（Google Drive）
 
 - 正: `MyDrive/sixfonia_yt_analytics/<channel>/<channel>_video_statistics_YYYYMMDD.csv`
 - 移行期のみ: `MyDrive/YouTube_Data/`（旧フラット構成）にもデュアルライト
 - スキーマ: `videoId, viewCount, likeCount, commentCount, videoURL, view_date`
 
+## 関連
+
+推し活ツール（新着一覧・未視聴チェック・画像生成）と日次収集の自動化（GCP）は別リポジトリに移行済み。
+全体の概要は [docs/oshikatsu_apps_overview.md](docs/oshikatsu_apps_overview.md) を参照。
+
 ## 開発メモ
 
 - ノートブックはロジックを持たず、`sixfonia_analytics` パッケージの関数を呼ぶだけにする
 - チャンネル追加・パス変更は `sixfonia_analytics/config.py` のみ編集
 - Colab で編集したノートブックは「ファイル → GitHub にコピーを保存」で本リポジトリへ同期
+- APIキーはコードに書かない（`auth.get_api_key` が Secrets / 環境変数から読む）

@@ -105,6 +105,9 @@ def load_latest_days(n_days: int = 2, channel_names: list[str] | None = None
         by_date = {config.STATS_FILE_RE.match(p.name).group(2): p
                    for p in list_stats_files(name)}
         for d in dates:
+            if d not in by_date:
+                print(f"[WARN] {name}: {d} のファイルがないためスキップ")
+                continue
             df = load_stats_csv(by_date[d])
             if df is not None:
                 out[d][name] = df

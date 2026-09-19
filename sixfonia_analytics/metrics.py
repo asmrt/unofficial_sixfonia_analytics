@@ -39,18 +39,25 @@ def get_last_complete_month_range(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Ti
 
 
 def aggregate_monthly_gains(df: pd.DataFrame) -> pd.DataFrame:
-    """直前の完全月の動画ごと月次増加量（再生/いいね/コメント）。"""
+    """直前の完全月の動画ごと月次増加量（再生/いいね/コメント）。
+
+    Diff列が欠けているデータ（likeCount等を持たない古いCSV由来）は
+    その指標だけスキップする。
+    """
     start, end = get_last_complete_month_range(df)
     last_month = df[(df["view_date"] >= start) & (df["view_date"] <= end)]
-    gains = (
-        last_month.groupby("videoId")
-        .agg(
-            monthly_views_gain=("viewCountDiff", "sum"),
-            monthly_likes_gain=("likeCountDiff", "sum"),
-            monthly_comments_gain=("commentCountDiff", "sum"),
-        )
-        .reset_index()
-    )
+    agg_map = {
+        out_col: (src_col, "sum")
+        for src_col, out_col in [
+            ("viewCountDiff", "monthly_views_gain"),
+            ("likeCountDiff", "monthly_likes_gain"),
+            ("commentCountDiff", "monthly_comments_gain"),
+        ]
+        if src_col in last_month.columns
+    }
+    if not agg_map:
+        raise ValueError("Diff列がありません。add_diff_columns 適用済みのDataFrameを渡してください。")
+    gains = last_month.groupby("videoId").agg(**agg_map).reset_index()
     gains["thumbnail_url"] = gains["videoId"].apply(thumbnail_url)
     gains["video_title"] = gains["videoId"]  # enrich.add_video_titles で上書き可
     return gains
@@ -90,6 +97,44 @@ def prepare_continuous_series(df: pd.DataFrame, value_col: str = "viewCountDiff"
         start, end = date_range
         out = out[(out["view_date"] >= start) & (out["view_date"] <= end)]
     return out
+
+
+# ============================================================
+# 任意期間の増加量（周年振り返り用）
+# ============================================================
+def period_gains(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    """期間内の最初と最後のスナップショットの差から動画ごとの増加量を返す。
+
+    viewCountDiff の合計ではなく端点差を使う。収集が飛んだ日があっても
+    期間全体の増加量を取りこぼさないため（Diff合計だと欠測日の伸びが
+    NaN になって落ちる）。
+
+    戻り値: videoId, views_at_start, views_at_end, views_gained,
+            first_date, last_date, days_covered
+    """
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    sub = (df[(df["view_date"] >= start) & (df["view_date"] <= end)]
+           .dropna(subset=["viewCount"])
+           .sort_values(["videoId", "view_date"]))
+    if sub.empty:
+        raise ValueError(f"期間内のデータがありません: {start.date()} 〜 {end.date()}")
+
+    first = sub.drop_duplicates("videoId", keep="first").set_index("videoId")
+    last = sub.drop_duplicates("videoId", keep="last").set_index("videoId")
+
+    out = pd.DataFrame({
+        "views_at_start": first["viewCount"],
+        "views_at_end": last["viewCount"],
+        "first_date": first["view_date"],
+        "last_date": last["view_date"],
+    }).reset_index()
+    out["views_gained"] = out["views_at_end"] - out["views_at_start"]
+    out["days_covered"] = (out["last_date"] - out["first_date"]).dt.days
+    out["gain_share_pct"] = (
+        out["views_gained"] / out["views_at_end"].replace(0, float("nan")) * 100
+    ).round(1)
+    out["thumbnail_url"] = out["videoId"].apply(thumbnail_url)
+    return out.sort_values("views_gained", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
