@@ -92,24 +92,22 @@ def get_videos_from_playlist(playlist_id, max_results=50):
 
 
 def get_video_statistics(video_ids):
-    """動画統計情報を取得"""
+    """動画統計情報を取得（サムネイルは動画マスタ側で持つのでここでは取得しない）"""
     stats = []
     for i in range(0, len(video_ids), 50):
         req = youtube.videos().list(
-            part="statistics,snippet",
+            part="statistics",
             id=",".join(video_ids[i:i + 50]),
         )
         res = req.execute()
         for item in res.get("items", []):
             s = item.get("statistics", {})
-            sn = item.get("snippet", {})
             stats.append({
                 "videoId": item["id"],
                 "viewCount": s.get("viewCount", "0"),
                 "likeCount": s.get("likeCount", "0"),
                 "commentCount": s.get("commentCount", "0"),
                 "videoURL": f"https://www.youtube.com/watch?v={item['id']}",
-                "thumbnail": sn.get("thumbnails", {}).get("default", {}).get("url", ""),
             })
         time.sleep(0.1)
     return stats
@@ -121,7 +119,7 @@ def save_to_gcs(channel_name, filename, data):
     bucket = client.bucket(GCS_BUCKET)
 
     buf = StringIO()
-    fields = ["videoId", "viewCount", "likeCount", "commentCount", "videoURL", "thumbnail", "view_date", "channel"]
+    fields = ["videoId", "viewCount", "likeCount", "commentCount", "videoURL", "view_date", "channel"]
     writer = csv.DictWriter(buf, fieldnames=fields)
     writer.writeheader()
     writer.writerows(data)

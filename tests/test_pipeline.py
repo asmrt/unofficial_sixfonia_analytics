@@ -115,7 +115,7 @@ def fake_storage():
 
 def stat_row(vid="v1", view_date="20260918", channel="lan"):
     return {"videoId": vid, "viewCount": "10", "likeCount": "2", "commentCount": "1",
-            "videoURL": f"https://www.youtube.com/watch?v={vid}", "thumbnail": "t",
+            "videoURL": f"https://www.youtube.com/watch?v={vid}",
             "view_date": view_date, "channel": channel}
 
 
@@ -177,7 +177,7 @@ def test_save_to_gcs_writes_csv_with_channel_last(stats):
     body = uploaded["lan/lan_video_statistics_20260918.csv"]
     header, first = list(csv.reader(io.StringIO(body)))
     assert header == ["videoId", "viewCount", "likeCount", "commentCount", "videoURL",
-                       "thumbnail", "view_date", "channel"]
+                       "view_date", "channel"]
     assert first[-1] == "lan"
     assert first[-2] == "20260918"
 
@@ -188,7 +188,7 @@ def test_csv_header_matches_ext_video_statistics_columns():
     table_cols = _parse_create_table_columns(ddl, table_index=0)
 
     assert table_cols == ["videoId", "viewCount", "likeCount", "commentCount", "videoURL",
-                           "thumbnail", "view_date", "channel"]
+                           "view_date", "channel"]
 
 
 def test_ext_videos_columns_are_keys_of_a_video_dict():
@@ -245,7 +245,7 @@ def test_fetch_channel_data_sets_channel_and_view_date_on_every_row(stats):
     stats.get_videos_from_playlist = lambda playlist_id: ["v1", "v2"]
     stats.get_video_statistics = lambda video_ids: [
         {"videoId": vid, "viewCount": "1", "likeCount": "0", "commentCount": "0",
-         "videoURL": f"https://www.youtube.com/watch?v={vid}", "thumbnail": ""}
+         "videoURL": f"https://www.youtube.com/watch?v={vid}"}
         for vid in video_ids
     ]
     saved = {}

@@ -114,6 +114,9 @@ gcloud storage buckets create gs://$BUCKET \
 > 保存期間を区切る必要が出た場合は、ライフサイクルルールで古い CSV を自動削除できます
 > （例: 30日で削除 → `gcloud storage buckets update gs://$BUCKET --lifecycle-file=lifecycle.json`）。
 
+> **既存データの移行**: 既存の Colab 運用の CSV をこのバケットに移す場合は、
+> このバケット（`$BUCKET`）を作成したあとに [docs/MIGRATION.md](MIGRATION.md) の手順で移行する。
+
 ## 4. BigQuery 外部テーブル・ビュー作成
 
 このリポジトリ（`unofficial_sixfonia_analytics`）を Cloud Shell に `git clone` するかアップロードし、**`pipeline/` ディレクトリから**実行します（手順6のデプロイも同じ場所基準）。
@@ -144,7 +147,7 @@ run_sql sql/02_create_views.sql
 
 作られるもの:
 
-- `ext_video_statistics`（外部テーブル）: `gs://$BUCKET/*.csv` を直接読む。列は `videoId, viewCount, likeCount, commentCount, videoURL, thumbnail, view_date, channel`。
+- `ext_video_statistics`（外部テーブル）: `gs://$BUCKET/*.csv` を直接読む。列は `videoId, viewCount, likeCount, commentCount, videoURL, view_date, channel`。
 - `ext_videos`（外部テーブル）: `gs://$BUCKET/master/videos.ndjson` を直接読む。列は `videoId, channel, title, publishedAt, durationSec, isShort, thumbnail, tags, available`。
 - `video_statistics`（ビュー）: `ext_video_statistics` をスネークケースの列名にしたもの。
 - `video_statistics_with_diff`（ビュー）: `video_statistics` の全列に `view_diff`（直前の日との再生数差）と
@@ -239,7 +242,7 @@ GCS にファイルができているか確認します。
 gcloud storage ls "gs://$BUCKET/**" | head -20
 ```
 
-- `{channel}/{channel}_video_statistics_{YYYYMMDD}.csv` × 7（日付は**実行日の前日**。8列で、最後の列が `channel`）
+- `{channel}/{channel}_video_statistics_{YYYYMMDD}.csv` × 7（日付は**実行日の前日**。7列で、最後の列が `channel`）
 - `master/videos.json` × 1（動画マスタ。`SNAPSHOT_URL` の `videos.json` のコピー）
 - `master/videos.ndjson` × 1（`videos.json` の `videos` 配列を1行1動画にした NDJSON。BigQuery の外部テーブルが読む）
 
@@ -373,7 +376,7 @@ GCS 上の CSV が唯一のデータなので、間違いに気づいたら同�
 gcloud storage cp 修正版.csv "gs://$BUCKET/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv"
 ```
 
-- 列の並び（8列: `videoId, viewCount, likeCount, commentCount, videoURL, thumbnail, view_date, channel`）は変えないこと。外部テーブルは位置で列を読みます。
+- 列の並び（7列: `videoId, viewCount, likeCount, commentCount, videoURL, view_date, channel`）は変えないこと。外部テーブルは位置で列を読みます。
 - 壊れた（列数が合わない・型が合わないなど）CSV が1つでも `gs://$BUCKET/*.csv` に混じると、`video_statistics` へのクエリ全体がエラーになります。差し替え後は一度クエリして確認してください。
 
 ### チャンネルの追加・削除

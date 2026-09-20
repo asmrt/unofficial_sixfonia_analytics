@@ -5,7 +5,8 @@
 -- YOUR_PROJECT_ID / YOUR_DATASET / YOUR_BUCKET は実行時に置換する（SETUP.md 手順4 の run_sql を参照）。
 --
 -- ext_video_statistics: CSV は列名の行を持つが、外部テーブルは位置で列を読む。
---   main.py の save_to_gcs() が書く列の並び（8列）と、この定義の並びを必ず一致させること。
+--   main.py の save_to_gcs() が書く列の並び（7列）と、この定義の並びを必ず一致させること。
+--   サムネイルは持たない（動画マスタ側、ビュー videos の thumbnail_url を使う）。
 -- ext_videos: 動画マスタ（videos.ndjson。main.py の copy_snapshot_to_gcs() が書く）を読む。
 -- =============================================================
 
@@ -15,7 +16,6 @@ CREATE OR REPLACE EXTERNAL TABLE `YOUR_PROJECT_ID.YOUR_DATASET.ext_video_statist
   likeCount    INT64,
   commentCount INT64,
   videoURL     STRING,
-  thumbnail    STRING,
   view_date    STRING,  -- YYYYMMDD
   channel      STRING
 )

@@ -5,6 +5,7 @@
 --
 -- video_statistics: ext_video_statistics をスネークケースの列名にしたもの。
 --   channel は CSV の列を優先し、無ければファイルパス（{channel}/...）から補う。
+--   サムネイルは持たない。動画マスタ側（ビュー videos の thumbnail_url）を使う。
 -- video_statistics_with_diff: video_statistics の全列に、直前の計測日との差を足す。
 --   - view_diff : 直前の計測日からの再生数の増分（その動画の最初の日は NULL）
 --   - diff_days : 何日前との差か（通常は 1。欠けた日があると 2 以上）
@@ -20,7 +21,6 @@ SELECT
   likeCount    AS like_count,
   commentCount AS comment_count,
   videoURL     AS video_url,
-  thumbnail    AS thumbnail_url,
   PARSE_DATE('%Y%m%d', view_date) AS view_date
 FROM `YOUR_PROJECT_ID.YOUR_DATASET.ext_video_statistics`
 -- 同じ日・同じ動画の行が複数ファイルにあった場合の防御（ファイル名が後のものを採用）

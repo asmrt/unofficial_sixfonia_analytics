@@ -29,8 +29,8 @@ BigQuery（データは持たず GCS を直接読む）
 CSV・NDJSON を差し替えれば次のクエリから反映される（移し替え処理・スケジュールクエリは無い）。
 
 > Colab ノートブックで手動で行っている日次収集を自動化するためのもの。当面は既存の Colab 運用と並行して動かす。
-> 既存の Colab 運用とは出力先も CSV の列も異なる（既存: 別バケット・6列 / 本パイプライン: `youtube-metrics-bucket`・`thumbnail` と `channel` を加えた8列。列名は既存と同じ）。
-> 既存の分析をこちらの出力に切り替える方法は未決定（[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) を参照）。
+> 既存の Colab 運用とは出力先も CSV の列も異なる（既存: 別バケット・6列 / 本パイプライン: `youtube-metrics-bucket`・`channel` を加えた7列。列名は既存と同じ。サムネイルは動画マスタ側で持つので統計 CSV には無い）。
+> 既存データの移行手順は [docs/MIGRATION.md](docs/MIGRATION.md) を参照。
 
 ### リポジトリ構成
 
@@ -39,11 +39,14 @@ pipeline/
 ├── README.md                            本書（設計書）
 ├── docs/
 │   ├── SETUP.md                         GCP セットアップ手順書
+│   ├── MIGRATION.md                     既存データ（Colab 運用の旧CSV）の移行手順
 │   ├── IMPROVEMENTS.md                  今後の改善点・未決事項
 │   └── legacy_implementation_guide.md   旧実装ガイド（参照用）
 ├── sql/
 │   ├── 01_create_external_tables.sql     GCS を直接読む外部テーブル作成 DDL
 │   └── 02_create_views.sql               スネークケース変換・前日比（view_diff）のビュー作成 DDL
+├── tools/
+│   └── migrate_legacy_csv.py            旧バケットの統計CSVを新バケットへ移行するツール
 └── youtube-data-fetch/                  Cloud Function: 統計取得 ＋ 動画マスタのコピー
     ├── main.py
     ├── requirements.txt
@@ -133,9 +136,10 @@ gs://{GCS_BUCKET}/{channel_name}/{channel_name}_video_statistics_{YYYYMMDD}.csv
 | likeCount | str | いいね数 |
 | commentCount | str | コメント数 |
 | videoURL | str | 動画URL |
-| thumbnail | str | サムネイルURL |
 | view_date | str | 計測日 (YYYYMMDD, JST, 実行日の前日) |
 | channel | str | チャンネル名（channels.json の name） |
+
+サムネイルは動画マスタ側（ビュー `videos` の `thumbnail_url`）で持つため、統計 CSV には含めない。
 
 外部テーブル `ext_video_statistics`（`sql/01`）はこの列を**位置**で読むため、列の並びを変える場合は SQL 側も合わせて変更する。
 
