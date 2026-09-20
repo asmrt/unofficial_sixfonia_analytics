@@ -25,6 +25,9 @@ NEW_COLUMNS = LEGACY_COLUMNS + ["channel"]
 
 _INT_RE = re.compile(r"^\d+$")
 
+# これらの問題が出たファイルは新形式にできていないので、移行先へは書き込まない
+NOT_WRITABLE_PROBLEMS = ("列が想定と違う", "空のファイル")
+
 # {prefix}/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv（prefix は無くてもよい）
 _BLOB_PATH_RE = re.compile(r"^(?:(?P<prefix>.+)/)?(?P<folder>[^/]+)/(?P<filename>[^/]+)$")
 _FILENAME_RE = re.compile(r"^(?P<channel>.+)_video_statistics_(?P<date>\d{8})\.csv$")
@@ -117,7 +120,8 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
     （パイプライン稼働後に書かれた日付を移行で上書きしないため）。
 
     戻り値: {"files": 対象ファイル数, "rows": 変換した行数, "written": 実際に書き込んだ数,
-             "skipped_existing": 移行先に既にあってスキップした数, "problems": 問題メッセージのリスト}
+             "skipped_existing": 移行先に既にあってスキップした数,
+             "skipped_broken": 新形式にできずスキップした数, "problems": 問題メッセージのリスト}
     """
     if client is None:
         client = storage.Client()
@@ -125,7 +129,8 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
     src_bucket = client.bucket(source_bucket)
     dst_bucket = client.bucket(dest_bucket)
 
-    summary = {"files": 0, "rows": 0, "written": 0, "skipped_existing": 0, "problems": []}
+    summary = {"files": 0, "rows": 0, "written": 0, "skipped_existing": 0,
+               "skipped_broken": 0, "problems": []}
 
     for blob in src_bucket.list_blobs(prefix=source_prefix):
         parsed = parse_blob_name(blob.name)
@@ -142,6 +147,13 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
         converted, problems = convert_csv(text, channel, file_date)
         for problem in problems:
             summary["problems"].append(f"{blob.name}: {problem}")
+
+        # 新形式にできなかったファイルは書き込まない。
+        # 列の並びが違う CSV が移行先に混じると、外部テーブル経由のクエリ全体が失敗するため
+        if any(p.startswith(prefix) for p in problems for prefix in NOT_WRITABLE_PROBLEMS):
+            summary["skipped_broken"] += 1
+            print(f"[SKIP] {blob.name} は新形式に変換できないため書き込みません")
+            continue
 
         row_count = max(len(converted.splitlines()) - 1, 0)
         summary["rows"] += row_count
@@ -194,6 +206,7 @@ def main(argv=None):
     print(f"行数: {summary['rows']}")
     print(f"書き込み: {summary['written']}")
     print(f"スキップ（移行先に既存）: {summary['skipped_existing']}")
+    print(f"スキップ（新形式にできない）: {summary['skipped_broken']}")
     if summary["problems"]:
         print(f"問題のあったファイル: {len(summary['problems'])}件")
         for problem in summary["problems"]:
