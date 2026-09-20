@@ -202,3 +202,39 @@ def test_migrate_reports_unparseable_blob_names_as_problems(mig):
 
     assert summary["files"] == 0
     assert any("lan_stats.csv" in p for p in summary["problems"])
+
+
+def test_migrate_does_not_write_files_it_cannot_convert(mig):
+    """列が想定と違う・空のファイルは、apply でも移行先に書き込まない。
+
+    並びの違う CSV が移行先に混じると、外部テーブル経由のクエリ全体が失敗するため。
+    """
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = (
+        "videoId,viewCount\nv1,10\n"
+    )
+    src.objects["youtube_stat/han/han_video_statistics_20260919.csv"] = ""
+
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, client=client)
+
+    assert summary["files"] == 2
+    assert summary["written"] == 0
+    assert summary["skipped_broken"] == 2
+    assert client.bucket("dst").objects == {}
+    assert any("列が想定と違う" in p for p in summary["problems"])
+    assert any("空のファイル" in p for p in summary["problems"])
+
+
+def test_migrate_writes_already_converted_file_as_is(mig):
+    """すでに7列のファイルは、変換せずそのまま書き込む"""
+    client = FakeClient()
+    src = client.bucket("src")
+    body = ",".join(mig.NEW_COLUMNS) + "\nv1,10,2,1,https://x/v1,20260918,lan\n"
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = body
+
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, client=client)
+
+    assert summary["written"] == 1
+    assert summary["skipped_broken"] == 0
+    assert client.bucket("dst").objects["lan/lan_video_statistics_20260918.csv"] == body
