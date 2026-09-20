@@ -14,12 +14,15 @@ YouTube API の規約（API Services Terms / Developer Policies）では、API �
 構築から30日の猶予がある認識のため、先に構築する（2026-09-19）。
 保存期間を区切ることになった場合は、GCS のライフサイクルルールで古い CSV を消すだけでよい（BigQuery は外部テーブルで GCS を直接読むので、自動でそろう）。
 
-### B. 既存の Colab 運用からの切り替え方法 — 未決定
+### B. 既存の Colab 運用からの切り替え方法 — 決定（2026-09-20）
 
 既存の Colab 運用とは、出力先のバケットも CSV の列も異なる
 （既存: 別バケット・6列 `videoId, viewCount, likeCount, commentCount, videoURL, view_date` /
-本パイプライン: `youtube-metrics-bucket`・`thumbnail` と `channel` を加えた8列。列名は既存と同じ camelCase）。
-既存の分析ノートブックをこちらの出力に切り替える方法（読み込み先の変更、過去 CSV の移行、列の扱い）を決める必要がある。
+本パイプライン: `youtube-metrics-bucket`・`channel` を加えた7列。列名は既存と同じ camelCase）。
+移行は `channel` 列を足すだけでよい。手順・ツールの詳細は [docs/MIGRATION.md](MIGRATION.md) を参照。
+
+サムネイルは動画マスタ側（ビュー `videos` の `thumbnail_url`）で持つので、統計 CSV では持たない
+（動画IDからサムネイルURLを組み立てることもできるため、統計側で二重に持つ必要が無い）。
 
 ### C. 動画マスタの生成元 — 決定（2026-09-19）: 外部で生成される `videos.json` に一本化
 
@@ -117,7 +120,7 @@ BigQuery は外部テーブル `ext_videos` でこれを読み、ビュー `vide
 ### 10. テストコード ✅ 対応済み（2026-09-19）
 
 `tests/test_pipeline.py` に追加（`pip install -e ".[dev]" && pytest tests -q`）。YouTube API・GCS・公開URLは偽物に差し替えて、
-50件ずつのバッチ処理、CSV の列順（8列・最後が channel）と外部テーブル `ext_video_statistics` の列定義の一致、
+50件ずつのバッチ処理、CSV の列順（7列・最後が channel）と外部テーブル `ext_video_statistics` の列定義の一致、
 各行に channel と view_date が入ること、view_date が JST の前日になること、一部チャンネル失敗時に 500 を返すこと、
 動画マスタのコピー（videos.json をそのまま、videos.ndjson を1行1動画で書くこと・不正な内容では何も書かないこと・失敗しても統計に影響しないこと）、
 外部テーブル `ext_videos` の列が動画マスタのキーにあること、チャンネル定義の一致を検査している。
