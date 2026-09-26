@@ -88,8 +88,15 @@ GROUP BY view_date ORDER BY view_date"
 ```
 
 クエリがエラーにならないこと、件数が移行元のファイルの行数と一致することを確認する。
-おかしければ、全量で実行する前にここで直す。ここで書き込んだファイルは、あとで `--overwrite` を付ければ上書きできる。
-バケットのバージョニングにより上書き前の版も残るので元に戻せる。
+おかしければ、全量で実行する前にここで直す。直したあとは、同じ3ファイルだけを上書きしてやり直す
+（一覧は名前順なので、`--limit 3` なら同じ3ファイルが選ばれる）。
+
+```bash
+python pipeline/tools/migrate_legacy_csv.py \
+  --source-bucket <移行元バケット> \
+  --dest-bucket $BUCKET \
+  --channel hima72 --limit 3 --overwrite --apply
+```
 
 ### 4. 全量で実行
 
@@ -107,12 +114,28 @@ python pipeline/tools/migrate_legacy_csv.py \
 
 手順3で書き込んだファイルは移行先に既に存在するので自動的にスキップされ、重複しない。
 それ以外で移行先に同名のファイルが既にある場合も自動的にスキップされる（後述の注意を参照）。
-何らかの事情で明示的に上書きしたい場合だけ `--overwrite` を付ける。
+全量では `--overwrite` を付けない。`--channel` を付けていても、そのチャンネルの全ファイルが対象になり、
+新パイプラインが既に書いた日付まで Colab 時代のファイルで上書きされる（ツールに日付の絞り込みは無い）。
+`--overwrite` を使うのは、手順3の少量のやり直し（`--limit 3`）だけにする。
 
-移行後にクエリがエラーになった場合は、`migration_suspicious_rows.csv` に出た行を次のどちらかで直す。
+移行後にクエリがエラーになった場合は、`migration_suspicious_rows.csv` に出たファイルだけを作り直す。
+移行元は書き換えていないので、何度でも作り直せる。
 
-- 移行元を直し、`--channel <チャンネル> --overwrite` で再実行する
-- 移行先の CSV を直接直して差し替える（[SETUP.md](SETUP.md) の「CSV を差し替える」）。差し替え前の版は 30 日間残るので元に戻せる
+1. 移行元のファイルを直す
+2. 移行先からそのファイルだけを消す（ファイル名の日付が、移行元の期間のものであることを確認してから）
+
+   ```bash
+   gcloud storage rm "gs://$BUCKET/<チャンネル>/<チャンネル>_video_statistics_<YYYYMMDD>.csv"
+   ```
+
+3. `--overwrite` を付けずに再実行する（消したファイルだけが書き込まれる）
+
+   ```bash
+   python pipeline/tools/migrate_legacy_csv.py \
+     --source-bucket <移行元バケット> \
+     --dest-bucket $BUCKET \
+     --channel <チャンネル> --apply
+   ```
 
 ### 5. BigQuery で検証
 
