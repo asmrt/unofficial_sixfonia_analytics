@@ -86,12 +86,22 @@ gcloud services enable \
 
 キーは環境変数ではなく **Secret Manager** に保管します（コンソールの関数詳細画面に平文で表示されるのを防ぐため）。
 
+キーをコマンドに直接書くと、Cloud Shell のコマンド履歴に残ります。次のどちらかで登録してください。
+
+**A. コンソールで登録する**: [Secret Manager](https://console.cloud.google.com/security/secret-manager) →「シークレットを作成」→ 名前を `youtube-api-key`、シークレットの値にキーを貼り付け。
+（リージョンは自動のままでよい。作成後、シークレット名が `youtube-api-key` になっていることを確認する）
+
+**B. コマンドで登録する**: 入力欄に貼り付ける形にすると、画面にも履歴にも残りません。
+
 ```bash
-echo -n "ここにAPIキーを貼り付け" | gcloud secrets create youtube-api-key --data-file=-
+read -rs -p "APIキー: " KEY; echo
+printf %s "$KEY" | gcloud secrets create youtube-api-key --data-file=-
+unset KEY
 ```
 
-> キーをローテーションする場合は `gcloud secrets versions add youtube-api-key --data-file=-` で
-> 新バージョンを追加し、関数を再デプロイ（または新リビジョン作成）してください。
+> キーをローテーションする場合は、A ならシークレットの「新しいバージョン」から、B なら
+> `gcloud secrets create` を `gcloud secrets versions add youtube-api-key` に替えて、新バージョンを追加します。
+> そのあと関数を再デプロイ（または新リビジョン作成）してください。
 
 > **補足（クォータ）**: YouTube Data API の無料クォータは 10,000 ユニット/日。
 > 本システムの消費は約 150 ユニット/日です（動画 約3,400本 ÷ 50件 × 2種類の list 呼び出し × 1 ユニット + チャンネル7件）。
@@ -117,6 +127,28 @@ gcloud storage buckets create gs://$BUCKET \
 > **既存データの移行**: 既存の Colab 運用の CSV をこのバケットに移す場合は、
 > このバケット（`$BUCKET`）を作成したあとに [docs/MIGRATION.md](MIGRATION.md) の手順で移行する。
 
+### 3-1. バージョニングの有効化
+
+GCS の CSV はデータの唯一の保管場所で、差し替えなどで上書き・削除することがあります。
+バージョニングを有効にすると、上書き・削除する前の版が 30 日間残り、元に戻せます（手順11「CSV を差し替える」）。
+30 日で自動削除されるのは古い版だけで、今のデータは削除されません。
+
+```bash
+gcloud storage buckets update gs://$BUCKET --versioning
+
+cat > lifecycle-noncurrent.json <<'EOF'
+{"rule": [{"action": {"type": "Delete"}, "condition": {"daysSinceNoncurrentTime": 30}}]}
+EOF
+gcloud storage buckets update gs://$BUCKET --lifecycle-file=lifecycle-noncurrent.json
+
+# 確認（versioning_enabled: true と、上のルールが出ればOK）
+gcloud storage buckets describe gs://$BUCKET --format="yaml(versioning_enabled,lifecycle_config)"
+```
+
+> バケットを作成済みの場合も、このブロックだけ実行すれば有効になります。
+> 古い版が残るのは毎日上書きされる `master/videos.json` などで、費用は月数円以下です。
+> 後でライフサイクルルールを足す場合は、このルールも同じファイルに含めてください（`--lifecycle-file` は設定を丸ごと置き換えます）。
+
 ## 4. BigQuery 外部テーブル・ビュー作成
 
 このリポジトリ（`unofficial_sixfonia_analytics`）を Cloud Shell に `git clone` するかアップロードし、**`pipeline/` ディレクトリから**実行します（手順6のデプロイも同じ場所基準）。
@@ -125,7 +157,8 @@ gcloud storage buckets create gs://$BUCKET \
 cd ~/unofficial_sixfonia_analytics/pipeline
 ```
 
-> 非公開リポジトリのため、`git clone` には GitHub の認証（`gh auth login` または Personal Access Token）が必要です。
+> 非公開リポジトリのため、`git clone` には GitHub の認証が必要です。`gh auth login`（画面の案内に従ってブラウザで認証）を使ってください。
+> Personal Access Token を `https://<token>@github.com/...` の形で URL に埋め込むと、トークンがコマンド履歴に残るので避けてください。
 > Cloud Shell へのアップロード: Cloud Shell 右上「⋮」→「アップロード」でフォルダごとアップロードできます。
 
 データセットを作成します。
@@ -246,6 +279,12 @@ gcloud storage ls "gs://$BUCKET/**" | head -20
 - `master/videos.json` × 1（動画マスタ。`SNAPSHOT_URL` の `videos.json` のコピー）
 - `master/videos.ndjson` × 1（`videos.json` の `videos` 配列を1行1動画にした NDJSON。BigQuery の外部テーブルが読む）
 
+CSV の中身も1つ見て、列名の行が 7 列で、最後が `channel` になっていること、各行の末尾にチャンネル名が入っていることを確認します。
+
+```bash
+gcloud storage cat "gs://$BUCKET/hima72/hima72_video_statistics_*.csv" | head -3
+```
+
 BigQuery（外部テーブル経由）で読めるか確認します。
 
 ```bash
@@ -276,9 +315,13 @@ gcloud run services add-iam-policy-binding youtube-data-fetch \
   --role="roles/run.invoker"
 ```
 
-ジョブを作成します（毎日 01:00 JST）。
+ジョブを作成します（毎日 01:00 JST）。関数の URL は手順7で変数に入れたものです。
+Cloud Shell を開き直していて空になっている場合は、先に取り直してください。
 
 ```bash
+STATS_URL=$(gcloud functions describe youtube-data-fetch --gen2 --region=$REGION --format='value(serviceConfig.uri)')
+echo "$STATS_URL"   # https:// で始まる URL が出ることを確認
+
 gcloud scheduler jobs create http youtube-daily-stats \
   --location=$REGION \
   --schedule="0 1 * * *" \
@@ -309,18 +352,20 @@ gcloud scheduler jobs run youtube-daily-stats --location=$REGION
 2. **アラートポリシー作成**: [ログエクスプローラ](https://console.cloud.google.com/logs/query) で以下のクエリを入力
 
    ```text
-   resource.type="cloud_run_revision"
-   resource.labels.service_name="youtube-data-fetch"
-   severity>=ERROR
+   (resource.type="cloud_run_revision" AND resource.labels.service_name="youtube-data-fetch" AND severity>=ERROR)
+   OR (resource.type="cloud_scheduler_job" AND severity>=ERROR)
    ```
+
+   2 行目は、Scheduler が関数を呼べなかった場合（権限の設定漏れ・URL の間違いなど）を拾うためのものです。
+   この場合は関数が一度も動かないので、関数のログにはエラーが出ません。
 
 3. クエリ結果上部の「アクション」→「ログアラートを作成」で以下を設定して保存:
    - ポリシー名: `youtube-fetch-error-alert`
    - 通知の頻度: 30分（同一障害での連続通知を抑制）
    - 通知チャネル: 手順1で作成したメール
 
-> これで「一部チャンネルの取得失敗」「動画マスタのコピー失敗」「関数自体のクラッシュ」をすべてこの 1 つのアラートで拾えます。
-> 失敗はすべて関数のログに出るので、確認先はここだけです。
+> これで「一部チャンネルの取得失敗」「動画マスタのコピー失敗」「関数自体のクラッシュ」「Scheduler が関数を呼べない」をこの 1 つのアラートで拾えます。
+> 関数の失敗は関数のログ（`gcloud functions logs read ...`）、呼び出しの失敗は Scheduler のログで確認します。
 > 動画マスタのコピー失敗は統計の取得とは独立なので、関数は 200 を返し、Scheduler のリトライは起きません（翌日の実行で最新版に上書きされます）。
 
 ## 10. 予算アラートの設定
@@ -378,6 +423,17 @@ gcloud storage cp 修正版.csv "gs://$BUCKET/{channel}/{channel}_video_statisti
 
 - 列の並び（7列: `videoId, viewCount, likeCount, commentCount, videoURL, view_date, channel`）は変えないこと。外部テーブルは位置で列を読みます。
 - 壊れた（列数が合わない・型が合わないなど）CSV が1つでも `gs://$BUCKET/*.csv` に混じると、`video_statistics` へのクエリ全体がエラーになります。差し替え後は一度クエリして確認してください。
+
+#### 30 日以内の差し替えを取り消す
+
+バージョニングが有効なら、誤った上書きや削除を 30 日以内に復旧できます。
+
+```bash
+# 過去の版を一覧（末尾の #数字 が版の番号）
+gcloud storage ls -a "gs://$BUCKET/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv"
+# 指定した版で元に戻す
+gcloud storage cp "gs://$BUCKET/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv#<版の番号>" "gs://$BUCKET/{channel}/{channel}_video_statistics_{YYYYMMDD}.csv"
+```
 
 ### チャンネルの追加・削除
 
