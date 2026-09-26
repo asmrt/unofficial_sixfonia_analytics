@@ -42,7 +42,7 @@ dry run の出力に問題（列が想定と違う、`view_date` がファイル
 が出たファイルは、移行元のファイルを直すか、`--channel` で対象チャンネルを絞って一旦除外する。
 
 怪しい行のうち、次の3つは移行後に `video_statistics` へのクエリ全体をエラーにする。
-できれば `--apply` の前に移行元を直す（直さずに取り込んだ場合は、手順3の「移行後にクエリがエラーになった場合」で直す）。
+できれば `--apply` の前に移行元を直す（直さずに取り込んだ場合は、手順4の「移行後にクエリがエラーになった場合」で直す）。
 
 - 列数が6でない
 - カウントが整数の形式でない（例: `123.0`）
@@ -58,7 +58,40 @@ python pipeline/tools/migrate_legacy_csv.py \
   --channel lan --channel hima72
 ```
 
-### 3. `--apply` で実行
+### 3. 少量で試す
+
+いきなり全量を `--apply` する前に、1チャンネルだけ少数のファイルで試す。
+
+```bash
+python pipeline/tools/migrate_legacy_csv.py \
+  --source-bucket <移行元バケット> \
+  --dest-bucket $BUCKET \
+  --channel hima72 --limit 3 --apply
+```
+
+書き込まれたファイルを1つ確認する。
+
+```bash
+gcloud storage cat "gs://$BUCKET/hima72/hima72_video_statistics_*.csv" | head -3
+```
+
+ヘッダーが `channel` で終わる7列になっていること、各行の末尾がそのチャンネル名になっていることを確認する。
+
+BigQuery でも、そのチャンネルだけクエリして件数を確認する。
+
+```bash
+bq query --use_legacy_sql=false "
+SELECT view_date, COUNT(*) AS row_count
+FROM \`$PROJECT_ID.$DATASET.video_statistics\`
+WHERE channel = 'hima72'
+GROUP BY view_date ORDER BY view_date"
+```
+
+クエリがエラーにならないこと、件数が移行元のファイルの行数と一致することを確認する。
+おかしければ、全量で実行する前にここで直す。ここで書き込んだファイルは、あとで `--overwrite` を付ければ上書きできる。
+バケットのバージョニングにより上書き前の版も残るので元に戻せる。
+
+### 4. 全量で実行
 
 問題が無い（または許容できる）ことを確認したら、実際に書き込む。
 
@@ -72,7 +105,8 @@ python pipeline/tools/migrate_legacy_csv.py \
 新形式（7列）にできなかったファイル（列が想定と違う・空）は、`--apply` でも書き込まずにスキップする。
 並びの違う CSV が移行先に混じると、外部テーブル経由のクエリ全体が失敗するため。
 
-移行先に同名のファイルが既にある場合も自動的にスキップされる（後述の注意を参照）。
+手順3で書き込んだファイルは移行先に既に存在するので自動的にスキップされ、重複しない。
+それ以外で移行先に同名のファイルが既にある場合も自動的にスキップされる（後述の注意を参照）。
 何らかの事情で明示的に上書きしたい場合だけ `--overwrite` を付ける。
 
 移行後にクエリがエラーになった場合は、`migration_suspicious_rows.csv` に出た行を次のどちらかで直す。
@@ -80,7 +114,7 @@ python pipeline/tools/migrate_legacy_csv.py \
 - 移行元を直し、`--channel <チャンネル> --overwrite` で再実行する
 - 移行先の CSV を直接直して差し替える（[SETUP.md](SETUP.md) の「CSV を差し替える」）。差し替え前の版は 30 日間残るので元に戻せる
 
-### 4. BigQuery で検証
+### 5. BigQuery で検証
 
 [SETUP.md](SETUP.md) 手順4で作成済みのビューにクエリを投げ、移行元の件数と突き合わせる。
 

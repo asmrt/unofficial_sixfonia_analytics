@@ -272,6 +272,54 @@ def test_migrate_writes_already_converted_file_as_is(mig):
     assert client.bucket("dst").objects["lan/lan_video_statistics_20260918.csv"] == body
 
 
+def test_migrate_limit_stops_after_reaching_limit(mig):
+    """limit=2 なら、条件に合うファイルが3件あっても書き込むのは2件だけ"""
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/lan/lan_video_statistics_20260917.csv"] = (
+        LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260917\n"
+    )
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v2,20,3,2,https://x/v2,20260918\n"
+    )
+    src.objects["youtube_stat/lan/lan_video_statistics_20260919.csv"] = (
+        LEGACY_HEADER + "v3,30,4,3,https://x/v3,20260919\n"
+    )
+
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, limit=2, client=client)
+
+    assert summary["files"] == 2
+    assert summary["written"] == 2
+    assert len(client.bucket("dst").objects) == 2
+
+    # 同じ試しをもう一度実行しても、既存でスキップしたぶんで打ち切られ、残りを書き込まない
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, limit=2, client=client)
+
+    assert summary["files"] == 2
+    assert summary["skipped_existing"] == 2
+    assert summary["written"] == 0
+    assert len(client.bucket("dst").objects) == 2
+
+
+def test_migrate_limit_does_not_count_unparseable_or_filtered_files(mig):
+    """形式が想定と違うファイルやチャンネル絞り込みで対象外になったファイルは limit を消費しない"""
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/lan/lan_stats.csv"] = "junk"
+    src.objects["youtube_stat/han/han_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260918\n"
+    )
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v2,20,3,2,https://x/v2,20260918\n"
+    )
+
+    summary = mig.migrate("src", "youtube_stat", "dst", channels=["lan"], apply=True, limit=1, client=client)
+
+    assert summary["files"] == 1
+    assert summary["written"] == 1
+    assert list(client.bucket("dst").objects) == ["lan/lan_video_statistics_20260918.csv"]
+
+
 def test_migrate_collects_suspicious_rows_with_file_name(mig):
     client = FakeClient()
     src = client.bucket("src")

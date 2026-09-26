@@ -143,12 +143,17 @@ def parse_blob_name(name):
     return folder, filename_match.group("date")
 
 
-def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=False, overwrite=False, client=None):
+def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=False, overwrite=False,
+            limit=None, client=None):
     """旧バケットの統計CSVを新バケットへ移行する。
 
     デフォルト（apply=False）は dry run で、何も書き込まずに実施予定の内容を表示するだけ。
     移行先に同名のオブジェクトが既にある場合は overwrite=True でない限りスキップする
     （パイプライン稼働後に書かれた日付を移行で上書きしないため）。
+
+    limit を指定すると、対象ファイル数（summary["files"]）がその件数に達した時点で処理を打ち切る。
+    ファイル名の形式が想定と違うものや --channel で絞り込まれて対象外になったものは
+    対象ファイル数に数えないので limit も消費しない。少量で試すときに使う。
 
     戻り値: {"files": 対象ファイル数, "rows": 変換した行数, "written": 実際に書き込んだ数,
              "skipped_existing": 移行先に既にあってスキップした数,
@@ -174,6 +179,9 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
         if channels and channel not in channels:
             continue
 
+        # スキップ（既存・変換不可）で continue する場合も打ち切れるよう、数える前に判定する
+        if limit is not None and summary["files"] >= limit:
+            break
         summary["files"] += 1
         text = blob.download_as_text()
         converted, problems, suspicious = convert_csv(text, channel, file_date)
@@ -236,6 +244,8 @@ def main(argv=None):
                          help="対象チャンネルを絞り込む（複数指定可。省略時は全チャンネル）")
     parser.add_argument("--apply", action="store_true", help="実際に書き込む（省略時は dry run のみ）")
     parser.add_argument("--overwrite", action="store_true", help="移行先に同名ファイルがあっても上書きする")
+    parser.add_argument("--limit", type=int, default=None,
+                         help="対象ファイル数がこの件数に達したら打ち切る（--channel と併用可。少量で試すとき用）")
     parser.add_argument("--log-file", default="migration_suspicious_rows.csv",
                          help="怪しい行の一覧を書き出すCSVのパス（デフォルト: migration_suspicious_rows.csv）")
     args = parser.parse_args(argv)
@@ -247,6 +257,7 @@ def main(argv=None):
         channels=args.channels,
         apply=args.apply,
         overwrite=args.overwrite,
+        limit=args.limit,
     )
 
     mode = "本番実行" if args.apply else "dry run（実際に書き込むには --apply を付けて再実行）"
