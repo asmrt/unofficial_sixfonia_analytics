@@ -55,6 +55,9 @@ class FakeBlob:
         self.name = name
 
     def download_as_text(self):
+        fail = self.bucket.read_failures.get(self.name)
+        if fail is not None:
+            raise fail
         return self.bucket.objects[self.name]
 
     def exists(self):
@@ -67,6 +70,8 @@ class FakeBlob:
 class FakeBucket:
     def __init__(self):
         self.objects = {}
+        # {blob名: 起こす例外}。ここに登録した名前だけ download_as_text が失敗する
+        self.read_failures = {}
 
     def blob(self, name):
         return FakeBlob(self, name)
@@ -223,6 +228,46 @@ def test_migrate_apply_writes_expected_blob_names_and_skips_existing(mig):
     assert list(csv.reader(io.StringIO(written)))[0] == mig.NEW_COLUMNS
     # 既存ファイルは触っていない
     assert dst.objects["han/han_video_statistics_20260919.csv"] == "既存の内容（上書きされない）"
+
+
+def test_migrate_continues_after_read_error_and_reruns_only_failed_file(mig):
+    """1ファイルの download_as_text が失敗しても、前後の正常なファイルは書き込まれる。
+
+    再実行時は、書き込み済みの2件はスキップされ、失敗した1件だけが読み直されて書き込まれる。
+    """
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/aaa/aaa_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260918\n"
+    )
+    src.objects["youtube_stat/bbb/bbb_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v2,20,3,2,https://x/v2,20260918\n"
+    )
+    src.objects["youtube_stat/ccc/ccc_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v3,30,4,3,https://x/v3,20260918\n"
+    )
+    failing_name = "youtube_stat/bbb/bbb_video_statistics_20260918.csv"
+    src.read_failures[failing_name] = TimeoutError("deadline exceeded")
+
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, client=client)
+
+    dst = client.bucket("dst")
+    assert summary["failed_read"] == 1
+    assert "aaa/aaa_video_statistics_20260918.csv" in dst.objects
+    assert "ccc/ccc_video_statistics_20260918.csv" in dst.objects
+    assert "bbb/bbb_video_statistics_20260918.csv" not in dst.objects
+    assert any(
+        failing_name in p and "読み込みに失敗" in p for p in summary["problems"]
+    )
+
+    # 「直った」ことにして再実行すると、失敗していた1件だけが書き込まれる
+    del src.read_failures[failing_name]
+    summary2 = mig.migrate("src", "youtube_stat", "dst", apply=True, client=client)
+
+    assert summary2["written"] == 1
+    assert summary2["skipped_existing"] == 2
+    assert summary2["failed_read"] == 0
+    assert "bbb/bbb_video_statistics_20260918.csv" in dst.objects
 
 
 def test_migrate_reports_unparseable_blob_names_as_problems(mig):
