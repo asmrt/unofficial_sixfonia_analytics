@@ -157,7 +157,9 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
 
     戻り値: {"files": 対象ファイル数, "rows": 変換した行数, "written": 実際に書き込んだ数,
              "skipped_existing": 移行先に既にあってスキップした数,
-             "skipped_broken": 新形式にできずスキップした数, "problems": 問題メッセージのリスト,
+             "skipped_broken": 新形式にできずスキップした数,
+             "failed_read": 読み込みに失敗してスキップした数,
+             "problems": 問題メッセージのリスト,
              "suspicious_rows": 怪しい行のリスト（各要素に "file" キーを追加）}
     """
     if client is None:
@@ -167,7 +169,7 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
     dst_bucket = client.bucket(dest_bucket)
 
     summary = {"files": 0, "rows": 0, "written": 0, "skipped_existing": 0,
-               "skipped_broken": 0, "problems": [], "suspicious_rows": []}
+               "skipped_broken": 0, "failed_read": 0, "problems": [], "suspicious_rows": []}
 
     for blob in src_bucket.list_blobs(prefix=source_prefix):
         parsed = parse_blob_name(blob.name)
@@ -183,7 +185,17 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
         if limit is not None and summary["files"] >= limit:
             break
         summary["files"] += 1
-        text = blob.download_as_text()
+
+        # ネットワークタイムアウトなど一過性のエラーで全体を止めない。
+        # このファイルは何も書き込まず、次回の再実行で読み直す
+        try:
+            text = blob.download_as_text()
+        except Exception as e:
+            summary["failed_read"] += 1
+            summary["problems"].append(f"{blob.name}: 読み込みに失敗（{type(e).__name__}）")
+            print(f"[FAIL] {blob.name} を読み込めませんでした（{type(e).__name__}）。もう一度実行すれば読み直します")
+            continue
+
         converted, problems, suspicious = convert_csv(text, channel, file_date)
         for problem in problems:
             summary["problems"].append(f"{blob.name}: {problem}")
@@ -268,6 +280,10 @@ def main(argv=None):
     print(f"書き込み: {summary['written']}")
     print(f"スキップ（移行先に既存）: {summary['skipped_existing']}")
     print(f"スキップ（新形式にできない）: {summary['skipped_broken']}")
+    print(f"読み込み失敗: {summary['failed_read']}")
+    if summary["failed_read"] > 0:
+        print("読み込みに失敗したファイルは書き込んでいません。"
+              "同じコマンドをもう一度実行してください（書き込み済みのファイルは自動で飛ばします）")
     if summary["problems"]:
         print(f"問題のあったファイル: {len(summary['problems'])}件")
         for problem in summary["problems"]:
