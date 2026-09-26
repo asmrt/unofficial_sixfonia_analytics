@@ -90,9 +90,10 @@ class FakeClient:
 def test_convert_csv_appends_channel_and_keeps_column_order(mig):
     text = LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260918\nv2,20,3,2,https://x/v2,20260918\n"
 
-    converted, problems = mig.convert_csv(text, "lan", "20260918")
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260918")
 
     assert problems == []
+    assert suspicious == []
     rows = list(csv.reader(io.StringIO(converted)))
     assert rows[0] == mig.NEW_COLUMNS
     assert rows[1] == ["v1", "10", "2", "1", "https://x/v1", "20260918", "lan"]
@@ -102,40 +103,71 @@ def test_convert_csv_appends_channel_and_keeps_column_order(mig):
 def test_convert_csv_reports_header_mismatch_and_leaves_text_unchanged(mig):
     text = "a,b,c\n1,2,3\n"
 
-    converted, problems = mig.convert_csv(text, "lan", "20260918")
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260918")
 
     assert converted == text
     assert any("列が想定と違う" in p for p in problems)
+    assert suspicious == []
 
 
 def test_convert_csv_reports_view_date_mismatch_but_keeps_row(mig):
     text = LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260101\n"
 
-    converted, problems = mig.convert_csv(text, "lan", "20260918")
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260918")
 
     assert any("view_date" in p for p in problems)
     rows = list(csv.reader(io.StringIO(converted)))
     assert rows[1][-1] == "lan"
     assert rows[1][5] == "20260101"  # 元の view_date は書き換えない
+    assert suspicious == [
+        {"line": 2, "column": "view_date", "value": "20260101", "reason": "ファイル名の日付（20260918）と違う"}
+    ]
 
 
 def test_convert_csv_reports_float_like_count_but_keeps_row(mig):
     text = LEGACY_HEADER + "v1,123.0,2,1,https://x/v1,20260918\n"
 
-    converted, problems = mig.convert_csv(text, "lan", "20260918")
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260918")
 
     assert any("viewCount" in p for p in problems)
     rows = list(csv.reader(io.StringIO(converted)))
     assert rows[1][1] == "123.0"
+    assert suspicious == [
+        {"line": 2, "column": "viewCount", "value": "123.0", "reason": "整数の形式でない"}
+    ]
+
+
+def test_convert_csv_reports_multiple_problems_on_one_row(mig):
+    """1行に複数の問題があれば、その数だけ suspicious にエントリが追加される"""
+    text = LEGACY_HEADER + "v1,123.0,abc,1,https://x/v1,20260101\n"
+
+    _, _, suspicious = mig.convert_csv(text, "lan", "20260918")
+
+    assert suspicious == [
+        {"line": 2, "column": "view_date", "value": "20260101", "reason": "ファイル名の日付（20260918）と違う"},
+        {"line": 2, "column": "viewCount", "value": "123.0", "reason": "整数の形式でない"},
+        {"line": 2, "column": "likeCount", "value": "abc", "reason": "整数の形式でない"},
+    ]
+
+
+def test_convert_csv_line_numbers_count_header_as_line_1(mig):
+    text = LEGACY_HEADER + "v1,10,2,1,https://x/v1,20260918\nv2,bad,3,2,https://x/v2,20260918\n"
+
+    _, _, suspicious = mig.convert_csv(text, "lan", "20260918")
+
+    assert suspicious == [
+        {"line": 3, "column": "viewCount", "value": "bad", "reason": "整数の形式でない"}
+    ]
 
 
 def test_convert_csv_leaves_already_converted_file_unchanged(mig):
     text = ",".join(mig.NEW_COLUMNS) + "\nv1,10,2,1,https://x/v1,20260918,lan\n"
 
-    converted, problems = mig.convert_csv(text, "lan", "20260918")
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260918")
 
     assert converted == text
     assert problems == ["変換済み"]
+    assert suspicious == []
 
 
 # ---- parse_blob_name -------------------------------------------------------
@@ -238,3 +270,74 @@ def test_migrate_writes_already_converted_file_as_is(mig):
     assert summary["written"] == 1
     assert summary["skipped_broken"] == 0
     assert client.bucket("dst").objects["lan/lan_video_statistics_20260918.csv"] == body
+
+
+def test_migrate_collects_suspicious_rows_with_file_name(mig):
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = (
+        LEGACY_HEADER + "v1,bad,2,1,https://x/v1,20260918\n"
+    )
+
+    summary = mig.migrate("src", "youtube_stat", "dst", client=client)
+
+    assert summary["suspicious_rows"] == [
+        {
+            "file": "youtube_stat/lan/lan_video_statistics_20260918.csv",
+            "line": 2,
+            "column": "viewCount",
+            "value": "bad",
+            "reason": "整数の形式でない",
+        }
+    ]
+
+
+def test_migrate_does_not_collect_suspicious_rows_for_skipped_broken_files(mig):
+    """変換できないファイル（列違い・空）は suspicious_rows にも含めない"""
+    client = FakeClient()
+    src = client.bucket("src")
+    src.objects["youtube_stat/lan/lan_video_statistics_20260918.csv"] = (
+        "videoId,viewCount\nv1,10\n"
+    )
+
+    summary = mig.migrate("src", "youtube_stat", "dst", apply=True, client=client)
+
+    assert summary["skipped_broken"] == 1
+    assert summary["suspicious_rows"] == []
+
+
+# ---- write_suspicious_rows_csv ----------------------------------------------
+
+def test_write_suspicious_rows_csv_writes_expected_header_and_rows(mig, tmp_path):
+    path = tmp_path / "suspicious.csv"
+    rows = [
+        {"file": "a.csv", "line": 2, "column": "viewCount", "value": "bad", "reason": "整数の形式でない"},
+    ]
+
+    mig.write_suspicious_rows_csv(rows, path)
+
+    content = path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    assert lines[0] == "file,line,column,value,reason"
+    assert lines[1] == "a.csv,2,viewCount,bad,整数の形式でない"
+
+
+def test_write_suspicious_rows_csv_creates_no_file_when_empty(mig, tmp_path):
+    """怪しい行が無い場合はファイルを作らない"""
+    path = tmp_path / "suspicious.csv"
+
+    mig.write_suspicious_rows_csv([], path)
+
+    assert not path.exists()
+
+
+def test_convert_csv_reports_row_with_wrong_column_count_but_keeps_row(mig):
+    text = (
+        "videoId,viewCount,likeCount,commentCount,videoURL,view_date\n"
+        "abc,100,10,1,https://www.youtube.com/watch?v=abc\n"
+    )
+    converted, problems, suspicious = mig.convert_csv(text, "lan", "20260901")
+
+    assert converted.splitlines()[1] == "abc,100,10,1,https://www.youtube.com/watch?v=abc,lan"
+    assert any("列数が6でない行が 1行" in p for p in problems)
+    assert {"line": 2, "column": "(列数)", "value": "5", "reason": "列数が6でない"} in suspicious

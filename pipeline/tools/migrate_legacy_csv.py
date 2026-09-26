@@ -10,6 +10,9 @@
 移行先に同名のファイルが既にある場合は `--overwrite` を付けない限り上書きしない
 （パイプライン稼働後の日付を移行で壊さないため）。
 
+怪しい行（view_date や件数列がおかしい行）は取り込みつつ、`--log-file`
+（デフォルト: migration_suspicious_rows.csv）に1行ずつ書き出す。
+
 手順は docs/MIGRATION.md を参照。
 """
 
@@ -36,9 +39,11 @@ _FILENAME_RE = re.compile(r"^(?P<channel>.+)_video_statistics_(?P<date>\d{8})\.c
 def convert_csv(text, channel, file_date):
     """レガシーCSV（テキスト）に channel 列を足した新形式に変換する。
 
-    戻り値は (変換後のCSVテキスト, 問題メッセージのリスト)。
+    戻り値は (変換後のCSVテキスト, 問題メッセージのリスト, 怪しい行のリスト)。
     行は削除しない（問題があっても報告するだけで変換は続ける）。
     すでに新形式（7列）のファイルは「変換済み」として、中身を変えずに返す。
+    怪しい行のリストは {"line": CSVの行番号（ヘッダーが1、最初のデータ行が2）,
+    "column": 列名, "value": 元の値, "reason": 理由} の辞書のリスト。
     """
     problems = []
     rows = list(csv.reader(io.StringIO(text)))
@@ -47,37 +52,63 @@ def convert_csv(text, channel, file_date):
         rows.pop()
 
     if not rows:
-        return text, ["空のファイル"]
+        return text, ["空のファイル"], []
 
     header = rows[0]
 
     if header == NEW_COLUMNS:
         problems.append("変換済み")
-        return text, problems
+        return text, problems, []
 
     if header != LEGACY_COLUMNS:
         problems.append(f"列が想定と違う: {header}")
-        return text, problems
+        return text, problems, []
 
     # 行ごとの問題は、同じ内容を何千行分も並べないよう「件数と最初の例」にまとめる
     bad_dates = []
     bad_counts = {col: [] for col in ("viewCount", "likeCount", "commentCount")}
+    bad_widths = []
+    suspicious = []
 
     out_rows = [NEW_COLUMNS]
-    for row in rows[1:]:
+    for line_no, row in enumerate(rows[1:], start=2):
         record = dict(zip(LEGACY_COLUMNS, row))
+
+        # 列数が違う行は、移行先で外部テーブルが読めずクエリ全体がエラーになる
+        if len(row) != len(LEGACY_COLUMNS):
+            bad_widths.append(len(row))
+            suspicious.append({
+                "line": line_no,
+                "column": "(列数)",
+                "value": str(len(row)),
+                "reason": f"列数が{len(LEGACY_COLUMNS)}でない",
+            })
 
         view_date = record.get("view_date", "")
         if view_date != file_date:
             bad_dates.append(view_date)
+            suspicious.append({
+                "line": line_no,
+                "column": "view_date",
+                "value": view_date,
+                "reason": f"ファイル名の日付（{file_date}）と違う",
+            })
 
         for col in ("viewCount", "likeCount", "commentCount"):
             value = record.get(col, "")
             if value != "" and not _INT_RE.match(value):
                 bad_counts[col].append(value)
+                suspicious.append({
+                    "line": line_no,
+                    "column": col,
+                    "value": value,
+                    "reason": "整数の形式でない",
+                })
 
         out_rows.append(row + [channel])
 
+    if bad_widths:
+        problems.append(f"列数が{len(LEGACY_COLUMNS)}でない行が {len(bad_widths)}行（例: {bad_widths[0]}列）")
     if bad_dates:
         problems.append(
             f"view_date がファイル名の日付（{file_date}）と違う行が {len(bad_dates)}行（例: {bad_dates[0]!r}）"
@@ -88,7 +119,7 @@ def convert_csv(text, channel, file_date):
 
     buf = io.StringIO()
     csv.writer(buf, lineterminator="\n").writerows(out_rows)
-    return buf.getvalue(), problems
+    return buf.getvalue(), problems, suspicious
 
 
 def parse_blob_name(name):
@@ -121,7 +152,8 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
 
     戻り値: {"files": 対象ファイル数, "rows": 変換した行数, "written": 実際に書き込んだ数,
              "skipped_existing": 移行先に既にあってスキップした数,
-             "skipped_broken": 新形式にできずスキップした数, "problems": 問題メッセージのリスト}
+             "skipped_broken": 新形式にできずスキップした数, "problems": 問題メッセージのリスト,
+             "suspicious_rows": 怪しい行のリスト（各要素に "file" キーを追加）}
     """
     if client is None:
         client = storage.Client()
@@ -130,7 +162,7 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
     dst_bucket = client.bucket(dest_bucket)
 
     summary = {"files": 0, "rows": 0, "written": 0, "skipped_existing": 0,
-               "skipped_broken": 0, "problems": []}
+               "skipped_broken": 0, "problems": [], "suspicious_rows": []}
 
     for blob in src_bucket.list_blobs(prefix=source_prefix):
         parsed = parse_blob_name(blob.name)
@@ -144,7 +176,7 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
 
         summary["files"] += 1
         text = blob.download_as_text()
-        converted, problems = convert_csv(text, channel, file_date)
+        converted, problems, suspicious = convert_csv(text, channel, file_date)
         for problem in problems:
             summary["problems"].append(f"{blob.name}: {problem}")
 
@@ -154,6 +186,9 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
             summary["skipped_broken"] += 1
             print(f"[SKIP] {blob.name} は新形式に変換できないため書き込みません")
             continue
+
+        for row in suspicious:
+            summary["suspicious_rows"].append({**row, "file": blob.name})
 
         row_count = max(len(converted.splitlines()) - 1, 0)
         summary["rows"] += row_count
@@ -177,6 +212,19 @@ def migrate(source_bucket, source_prefix, dest_bucket, *, channels=None, apply=F
     return summary
 
 
+def write_suspicious_rows_csv(suspicious_rows, path):
+    """怪しい行のリストを CSV（file,line,column,value,reason）として書き出す。
+
+    リストが空の場合は何もしない（空のログファイルを作らない）。
+    """
+    if not suspicious_rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["file", "line", "column", "value", "reason"])
+        writer.writeheader()
+        writer.writerows(suspicious_rows)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="旧GCSバケットの統計CSVを新バケットへ移行する（channel列を追加するだけ）。手順は docs/MIGRATION.md を参照。",
@@ -188,6 +236,8 @@ def main(argv=None):
                          help="対象チャンネルを絞り込む（複数指定可。省略時は全チャンネル）")
     parser.add_argument("--apply", action="store_true", help="実際に書き込む（省略時は dry run のみ）")
     parser.add_argument("--overwrite", action="store_true", help="移行先に同名ファイルがあっても上書きする")
+    parser.add_argument("--log-file", default="migration_suspicious_rows.csv",
+                         help="怪しい行の一覧を書き出すCSVのパス（デフォルト: migration_suspicious_rows.csv）")
     args = parser.parse_args(argv)
 
     summary = migrate(
@@ -213,6 +263,17 @@ def main(argv=None):
             print(f"  - {problem}")
     else:
         print("問題: なし")
+
+    suspicious_rows = summary["suspicious_rows"]
+    if suspicious_rows:
+        write_suspicious_rows_csv(suspicious_rows, args.log_file)
+        if args.apply:
+            note = "（取り込みは行っています。BigQuery でエラーになる場合はこの一覧で直す）"
+        else:
+            note = "（--apply 時もそのまま書き込みます）"
+        print(f"怪しい行: {len(suspicious_rows)}件 → {args.log_file}{note}")
+    else:
+        print("怪しい行: なし")
 
 
 if __name__ == "__main__":
